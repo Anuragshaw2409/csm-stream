@@ -1146,7 +1146,9 @@ async def startup_event():
 async def shutdown_event():
     logger.info("Server shutting down...")
 
-from flask import Flask, jsonify, request, send_file
+class ConversationUpdate(BaseModel):
+    user_message: str
+    ai_message: str
 
 @app.get("/api/conversations")
 async def get_conversations(request: Request):
@@ -1157,16 +1159,15 @@ async def get_conversations(request: Request):
     conn.close()
     return JSONResponse(content=data)
 
-@app.route("/api/conversations/<int:conv_id>", methods=["PUT"])
-def update_conversation(conv_id):
-    data = request.get_json()
+@app.put("/api/conversations/{conv_id}")
+async def update_conversation(conv_id: int, update: ConversationUpdate):
     conn = sqlite3.connect("companion.db")
     cur = conn.cursor()
     cur.execute("UPDATE conversations SET user_message=?, ai_message=? WHERE id=?",
-                (data["user_message"], data["ai_message"], conv_id))
+                (update.user_message, update.ai_message, conv_id))
     conn.commit()
     conn.close()
-    return "", 204
+    return JSONResponse(content={"status": "updated", "id": conv_id})
 
 @app.delete("/api/conversations")
 async def delete_all_conversations():
