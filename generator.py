@@ -232,12 +232,20 @@ class Generator:
             generation_start = time.time()
 
             while i < max_generation_len:
+                # curr_pos indexes into a fixed-size (max_seq_len) causal mask;
+                # stop before it would run out of bounds and crash the CUDA kernel.
+                if curr_pos.max().item() + 1 >= self.max_seq_len:
+                    logger.warning("Reached model max_seq_len during generation, stopping early.")
+                    break
+
                 batch_end = min(i + batch_size, max_generation_len)
                 batch_size_actual = batch_end - i
 
                 batch_samples = []
 
                 for _ in range(batch_size_actual):
+                    if curr_pos.max().item() + 1 >= self.max_seq_len:
+                        break
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                         sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
                         if torch.cuda.is_available() and hasattr(torch, "cuda") and hasattr(torch.cuda, "is_available"):

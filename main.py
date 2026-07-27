@@ -605,8 +605,9 @@ def add_segment(text, speaker_id, audio_tensor):
                     audio_frames = segment.audio.size(0) // 6094
                     total_tokens += audio_frames
 
-            # If we are within limits, the trimming is done.
-            if total_tokens <= 4096:
+            # Model's hard position limit is 2048; leave headroom for the new
+            # text segment plus the frames about to be generated.
+            if total_tokens <= 1024:
                 break
 
             # Otherwise, remove the oldest dynamic segment and re-check in the next loop iteration.
@@ -629,7 +630,7 @@ def add_segment(text, speaker_id, audio_tensor):
         while dynamic_segments:
             total_estimated_tokens = sum(estimate_tokens(s) for s in protected_segments) + \
                                      sum(estimate_tokens(s) for s in dynamic_segments)
-            if total_estimated_tokens <= 2048:
+            if total_estimated_tokens <= 1024:
                 break
             dynamic_segments.pop(0)
 
