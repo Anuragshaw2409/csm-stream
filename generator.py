@@ -147,26 +147,6 @@ class Generator:
 
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
 
-    def release_graph_memory(self):
-        """Free captured CUDA graph memory pools after a complete response has
-        been uttered, instead of letting them accumulate across the whole
-        conversation. The next generate_stream() call re-captures graphs (a
-        cheap one-time cost) rather than needing a full recompile, since the
-        underlying compiled kernels stay cached.
-        """
-        try:
-            from torch._inductor.cudagraph_trees import reset_cudagraph_trees
-            reset_cudagraph_trees()
-        except Exception as e:
-            logger.warning(f"reset_cudagraph_trees unavailable ({e}); falling back to torch._dynamo.reset()")
-            try:
-                torch._dynamo.reset()
-            except Exception as e2:
-                logger.warning(f"torch._dynamo.reset() also failed: {e2}")
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     @torch.inference_mode()
     def _decode_frames(self, frames):
         if not frames:
