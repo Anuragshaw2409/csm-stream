@@ -584,6 +584,12 @@ def speak_streaming(user_text, session_id="default"):
         except Exception as e:
             logger.error(f"Generation {this_id} - failed to send completion status: {e}")
 
+        if generator is not None:
+            try:
+                generator.release_graph_memory()
+            except Exception as e:
+                logger.error(f"Generation {this_id} - failed to release CUDA graph memory: {e}")
+
         with user_input_lock:
             if pending_user_inputs:
                 logger.info(f"Generation {this_id} - processing pending input queued during this turn")
