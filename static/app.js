@@ -7,11 +7,21 @@ let isLoading = false;
 document.addEventListener('DOMContentLoaded', async () => {
   await populateAudioDevices();
 
-  ws = new WebSocket(`ws://${window.location.host}/ws`);
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
   ws.onopen = () => {
     console.log("WebSocket connected, requesting saved config...");
     ws.send(JSON.stringify({ type: "request_saved_config" }));
+  };
+
+  ws.onerror = (err) => {
+    console.error("WebSocket error:", err);
+    alert("WebSocket connection failed. If you're accessing this page over HTTPS, make sure your tunnel forwards WebSocket connections too.");
+  };
+
+  ws.onclose = () => {
+    console.warn("WebSocket closed.");
   };
 
   ws.onmessage = async (event) => {
@@ -58,8 +68,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
 
   document.getElementById('testMicBtn').addEventListener('click', async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert("Microphone access requires a secure context (HTTPS or localhost). Access this page over HTTPS through your tunnel.");
+      return;
+    }
+
     const micId = getSelectedMic();
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: micId } });
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: micId ? { deviceId: micId } : true });
+    } catch (err) {
+      console.error("Failed to access microphone:", err);
+      alert(`Failed to access microphone: ${err.message}`);
+      return;
+    }
 
     micContext = new AudioContext();
     micSource = micContext.createMediaStreamSource(micStream);
@@ -88,22 +109,39 @@ document.addEventListener('DOMContentLoaded', async () => {
     setTimeout(() => recorder.stop(), 3000);
   });
 
-  document.getElementById('testOutputBtn').addEventListener('click', () => {
+  document.getElementById('testOutputBtn').addEventListener('click', async () => {
     const audio = new Audio('/static/test.mp3');
-    audio.setSinkId(getSelectedOutput()).then(() => {
+    const outputId = getSelectedOutput();
+
+    const playWithVisualizer = () => {
       outputAudioCtx = new AudioContext();
       const outputSource = outputAudioCtx.createMediaElementSource(audio);
       outputAnalyser = outputAudioCtx.createAnalyser();
       outputSource.connect(outputAnalyser);
       outputAnalyser.connect(outputAudioCtx.destination);
       visualizeMic(outputAnalyser, 'outputCanvas');
-      audio.play();
-    }).catch(err => {
-      console.warn("Failed to route output:", err);
-    });
+      audio.play().catch(err => {
+        console.error("Failed to play test audio:", err);
+        alert(`Failed to play test audio: ${err.message}`);
+      });
+    };
+
+    if (typeof audio.setSinkId === 'function' && outputId && outputId !== 'default') {
+      try {
+        await audio.setSinkId(outputId);
+      } catch (err) {
+        console.warn("Failed to route output to selected device, using default:", err);
+      }
+    }
+    playWithVisualizer();
   });
 
   document.getElementById('saveAndStart').addEventListener('click', () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      alert("Not connected to the server. Refresh the page and try again.");
+      return;
+    }
+
     lastConfig = {
       system_prompt: document.getElementById('systemPrompt').value,
       model_path: document.getElementById('modelPath').value,
