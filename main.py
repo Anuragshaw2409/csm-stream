@@ -1118,15 +1118,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
-    return templates.TemplateResponse("setup.html", {"request": request})
+    return templates.TemplateResponse(request, "setup.html")
 
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_page(request: Request):
-    return templates.TemplateResponse("chat.html", {"request": request})
+    return templates.TemplateResponse(request, "chat.html")
 
 @app.on_event("startup")
 async def startup_event():
@@ -1198,7 +1198,7 @@ templates = Jinja2Templates(directory="templates")
 
 @app.get("/crud", response_class=HTMLResponse)
 async def crud_ui(request: Request):
-    return templates.TemplateResponse("crud.html", {"request": request})
+    return templates.TemplateResponse(request, "crud.html")
 
 if __name__ == "__main__":
     import uvicorn
