@@ -17,7 +17,7 @@ class LLMInterface:
         self.llm = LLM(
             model=model_path,
             tensor_parallel_size=1,  # Adjust based on number of GPUs available
-            gpu_memory_utilization=0.6,
+            gpu_memory_utilization=0.25,
             max_model_len=max_tokens,
             swap_space=0,
             trust_remote_code=True,

@@ -3,7 +3,8 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"  
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1" 
-os.environ["PYTORCH_DISABLE_CUDA_GRAPHS"] = "1"  
+os.environ["PYTORCH_DISABLE_CUDA_GRAPHS"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import platform
 import sqlite3
 import time
