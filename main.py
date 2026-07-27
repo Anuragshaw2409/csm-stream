@@ -2,8 +2,6 @@ import asyncio
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"  
-os.environ["PYTORCH_DISABLE_CUDA_GRAPHS"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import platform
 import sqlite3
 import time
@@ -625,7 +623,6 @@ def model_worker(cfg: CompanionConfig):
     logger.info("Model worker thread started")
 
     if generator is None:
-        torch._inductor.config.triton.cudagraphs = False  # Disable cudagraphs
         torch._inductor.config.fx_graph_cache = False  # Disable graph caching
         logger.info("Loading voice model inside worker thread …")
         generator = load_csm_1b_local(cfg.model_path, "cuda")
