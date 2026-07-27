@@ -584,12 +584,15 @@ def speak_streaming(user_text, session_id="default"):
         except Exception as e:
             logger.error(f"Generation {this_id} - failed to send completion status: {e}")
 
+        # Release before reprocessing any pending input - process_pending_inputs()
+        # spawns a new speak_streaming() thread that needs to acquire this same
+        # lock, which would otherwise always fail while we still hold it here.
+        audio_gen_lock.release()
+
         with user_input_lock:
             if pending_user_inputs:
                 logger.info(f"Generation {this_id} - processing pending input queued during this turn")
                 process_pending_inputs()
-
-        audio_gen_lock.release()
 
 
 def process_user_input(user_text, session_id="default"):

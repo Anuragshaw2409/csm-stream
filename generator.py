@@ -255,7 +255,10 @@ class Generator:
                     if curr_pos.max().item() + 1 >= self.max_seq_len:
                         break
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                        sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                        sample = self._model.generate_frame(
+                            curr_tokens, curr_tokens_mask, curr_pos, temperature, topk,
+                            num_codebooks=self._num_codebooks // 2
+                        )
                         if torch.cuda.is_available() and hasattr(torch, "cuda") and hasattr(torch.cuda, "is_available"):
                             try:
                                 torch.cuda.synchronize()  # Force sync before checking
@@ -590,7 +593,7 @@ def load_csm_1b_local(model_path: str, device: str = "cuda", audio_num_codebooks
     # will eventually exhaust the GPU. Past this limit, dynamo falls back to
     # plain eager execution for new shapes instead of capturing more graphs -
     # slower for the overflow case, but memory growth stays bounded.
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 8
 
     model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
     model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
@@ -706,7 +709,8 @@ def warmup_generator(gen: Generator, warmup_text: str = "Hello, this is a compre
         # Generate multiple frames with different parameters
         for temp in [0.6, 0.7, 0.8]:
             for topk in [20, 30, 40]:
-                _ = gen._model.generate_frame(dummy_tokens, dummy_mask, dummy_pos, temp, topk)
+                _ = gen._model.generate_frame(dummy_tokens, dummy_mask, dummy_pos, temp, topk,
+                                               num_codebooks=gen._num_codebooks // 2)
     
     gen._text_token_cache.clear()
     
@@ -779,7 +783,7 @@ def load_csm_1b(device: str = "cuda") -> Generator:
     # will eventually exhaust the GPU. Past this limit, dynamo falls back to
     # plain eager execution for new shapes instead of capturing more graphs -
     # slower for the overflow case, but memory growth stays bounded.
-    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.cache_size_limit = 8
 
     model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
     model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)

@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -130,6 +131,7 @@ class Model(
         input_pos: torch.Tensor,
         temperature: float,
         topk: int,
+        num_codebooks: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -137,12 +139,22 @@ class Model(
             tokens_mask: (batch_size, seq_len, audio_num_codebooks+1)
             input_pos: (batch_size, seq_len) positions for each token
             mask: (batch_size, seq_len, max_seq_len
+            num_codebooks: if given and less than the model's full
+                audio_num_codebooks, only this many codebooks are actually
+                sampled by the decoder (the expensive part - one forward pass
+                per codebook). The remaining tail codebooks are zero-padded
+                in the returned tensor so it still has the width required to
+                be fed back in as input for the next frame. This is a
+                latency/quality trade-off: the model was trained always
+                seeing real values there, so audio fidelity may degrade.
 
         Returns:
             (batch_size, audio_num_codebooks) sampled tokens
         """
         dtype = next(self.parameters()).dtype
         b, s, _ = tokens.size()
+        total_codebooks = self.config.audio_num_codebooks
+        codebooks_to_generate = num_codebooks if num_codebooks else total_codebooks
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
@@ -162,7 +174,7 @@ class Model(
 
         # Decoder caches must be reset every frame.
         self.decoder.reset_caches()
-        for i in range(1, self.config.audio_num_codebooks):
+        for i in range(1, codebooks_to_generate):
             curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
             decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
                 dtype=dtype
@@ -174,6 +186,13 @@ class Model(
             curr_h = ci_embed
             curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
             curr_pos = curr_pos[:, -1:] + 1
+
+        if codebooks_to_generate < total_codebooks:
+            pad = torch.zeros(
+                curr_sample.size(0), total_codebooks - codebooks_to_generate,
+                dtype=curr_sample.dtype, device=curr_sample.device
+            )
+            curr_sample = torch.cat([curr_sample, pad], dim=1)
 
         return curr_sample
 
