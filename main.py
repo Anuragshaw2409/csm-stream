@@ -111,7 +111,7 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 config_manager = ConfigManager()
-model_id = "openai/whisper-large-v3-turbo"
+model_id = "openai/whisper-tiny"
 # Whisper
 whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
     model_id, torch_dtype=torch.float16, low_cpu_mem_usage=True, use_safetensors=True
@@ -550,7 +550,12 @@ def save_audio_and_trim(path, session_id, speaker_id, tensor, sample_rate):
                 os.remove(old_path)
                 logger.info(f"Removed old audio file from other speaker: {old_path}")
 
-MAX_SEGMENTS = 8
+# CSM's audio context window is only for voice continuity, not conversation
+# memory (that's handled separately by the RAG system + LLM history). Keep it
+# small so the model never approaches its fixed 2048-token position limit,
+# no matter how long the overall conversation runs.
+MAX_DYNAMIC_VOICE_TURNS = 2  # each turn = 1 user segment + 1 AI segment
+MAX_SEGMENTS = MAX_DYNAMIC_VOICE_TURNS * 2
 
 def add_segment(text, speaker_id, audio_tensor):
     """
@@ -582,11 +587,10 @@ def add_segment(text, speaker_id, audio_tensor):
     new_segment = Segment(text=text, speaker=speaker_id, audio=audio_tensor)
     dynamic_segments.append(new_segment)
 
-    # First, trim by MAX_SEGMENTS count. The oldest dynamic segments are removed.
-    max_dynamic_allowed = MAX_SEGMENTS - len(protected_segments)
-    if len(dynamic_segments) > max_dynamic_allowed:
-        # Keep only the most recent dynamic segments
-        dynamic_segments = dynamic_segments[-max_dynamic_allowed:]
+    # Keep only the last MAX_DYNAMIC_VOICE_TURNS conversational turns of audio
+    # context, regardless of how many protected reference clips are configured.
+    if len(dynamic_segments) > MAX_SEGMENTS:
+        dynamic_segments = dynamic_segments[-MAX_SEGMENTS:]
 
     # Then, check and trim by token count if necessary.
     # This loop will trim the oldest dynamic segments until the token count is acceptable.
