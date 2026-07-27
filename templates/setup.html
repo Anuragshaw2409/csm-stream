@@ -53,11 +53,11 @@ display: none;
 <label>System Prompt:
 <textarea id="systemPrompt" class="w-full p-2 bg-gray-700 rounded mt-1">You are a friendly AI.</textarea>
 </label>
-<label>Model Path:
-<input type="text" id="modelPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="./finetuned_model">
+<label>Model Path (CSM, HuggingFace repo id or local HF checkpoint dir):
+<input type="text" id="modelPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="sesame/csm-1b">
 </label>
-<label>LLM Path (GGUF):
-<input type="text" id="llmPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="./models/llama3-8b-instruct.gguf">
+<label>LLM Path (HuggingFace repo id or local HF checkpoint dir, not GGUF):
+<input type="text" id="llmPath" class="w-full p-2 bg-gray-700 rounded mt-1" value="meta-llama/Llama-3.2-3B-Instruct">
 </label>
 
 <!-- Primary Reference (Required) -->
