@@ -257,7 +257,7 @@ class Generator:
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                         sample = self._model.generate_frame(
                             curr_tokens, curr_tokens_mask, curr_pos, temperature, topk,
-                            num_codebooks=self._num_codebooks // 2
+                            num_codebooks=self._num_codebooks
                         )
                         if torch.cuda.is_available() and hasattr(torch, "cuda") and hasattr(torch.cuda, "is_available"):
                             try:
@@ -710,7 +710,7 @@ def warmup_generator(gen: Generator, warmup_text: str = "Hello, this is a compre
         for temp in [0.6, 0.7, 0.8]:
             for topk in [20, 30, 40]:
                 _ = gen._model.generate_frame(dummy_tokens, dummy_mask, dummy_pos, temp, topk,
-                                               num_codebooks=gen._num_codebooks // 2)
+                                               num_codebooks=gen._num_codebooks)
     
     gen._text_token_cache.clear()
     
