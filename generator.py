@@ -166,6 +166,7 @@ class Generator:
         temperature: float = 0.7,
         topk: int = 30,
         on_chunk_generated: Optional[Callable[[torch.Tensor], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ):
         """
         Generate audio in a streaming fashion, optimized for lower latency to first chunk.
@@ -232,6 +233,10 @@ class Generator:
             generation_start = time.time()
 
             while i < max_generation_len:
+                if cancel_event is not None and cancel_event.is_set():
+                    logger.info("generate_stream cancelled, stopping early.")
+                    break
+
                 # curr_pos indexes into a fixed-size (max_seq_len) causal mask;
                 # stop before it would run out of bounds and crash the CUDA kernel.
                 if curr_pos.max().item() + 1 >= self.max_seq_len:
@@ -244,6 +249,8 @@ class Generator:
                 batch_samples = []
 
                 for _ in range(batch_size_actual):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
                     if curr_pos.max().item() + 1 >= self.max_seq_len:
                         break
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):

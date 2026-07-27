@@ -346,17 +346,23 @@ def extract_complete_sentences(buffer_text):
     return sentences, buffer_text[end:]
 
 
-def _generate_sentence_audio(sentence_text, turn_context, pending_audio_chunks, gen_id):
-    """Run CSM on a single completed LLM sentence.
+def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id):
+    """Run CSM on a single completed LLM sentence, streaming each resulting
+    audio chunk to the client immediately as it's generated (true streaming
+    playback - no waiting for the rest of the response). Also appends the
+    generated audio to turn_context so the next sentence in this turn stays
+    prosody-consistent with this one.
 
-    Appends resulting chunks to pending_audio_chunks (buffered, not sent to the
-    client yet) and appends the generated audio to turn_context so the next
-    sentence in this turn stays prosody-consistent with this one.
+    playback_state is a dict shared across every sentence in this turn:
+        {"all_chunks": [...], "chunk_counter": int, "gen_id": int}
+
+    Cancellation is cooperative: generator.generate_stream() itself checks
+    interrupt_flag (passed as cancel_event) and stops within about one frame,
+    so there's no need to kill/restart the model worker thread here - we just
+    stop forwarding chunks and let the worker's (now-fast) EOS marker arrive.
 
     Returns False if generation was aborted due to a barge-in, True otherwise.
     """
-    global model_thread_running
-
     sentence_text = preprocess_text_for_tts(sentence_text.lower())
     if not sentence_text:
         return True
@@ -375,23 +381,13 @@ def _generate_sentence_audio(sentence_text, turn_context, pending_audio_chunks, 
     ))
 
     sentence_chunks = []
+    aborted = False
     while True:
-        if interrupt_flag.is_set():
-            logger.info(f"Generation {gen_id} - interrupt detected mid-sentence, resetting model worker")
-            model_thread_running.clear()
-            time.sleep(0.1)
-            model_thread_running.set()
-            start_model_thread()
-            while not model_result_queue.empty():
-                try:
-                    model_result_queue.get_nowait()
-                except queue.Empty:
-                    break
-            return False
-
         try:
-            result = model_result_queue.get(timeout=0.1)
+            result = model_result_queue.get(timeout=0.5)
         except queue.Empty:
+            if interrupt_flag.is_set():
+                aborted = True
             continue
 
         if result is None:
@@ -400,9 +396,38 @@ def _generate_sentence_audio(sentence_text, turn_context, pending_audio_chunks, 
             logger.error(f"Generation {gen_id} - sentence generation error: {result}")
             break
 
-        sentence_chunks.append(result.cpu().numpy().astype(np.float32))
+        if interrupt_flag.is_set():
+            aborted = True
+            continue  # keep draining until EOS, but stop forwarding chunks
 
-    pending_audio_chunks.extend(sentence_chunks)
+        chunk_array = result.cpu().numpy().astype(np.float32)
+        sentence_chunks.append(chunk_array)
+
+        playback_state["chunk_counter"] += 1
+        chunk_num = playback_state["chunk_counter"]
+        audio_queue.put(chunk_array)
+
+        if chunk_num == 1:
+            asyncio.run_coroutine_threadsafe(
+                message_queue.put({"type": "audio_status", "status": "first_chunk", "gen_id": gen_id}),
+                loop
+            )
+
+        asyncio.run_coroutine_threadsafe(
+            message_queue.put({
+                "type": "audio_chunk",
+                "audio": chunk_array.tolist(),
+                "sample_rate": generator.sample_rate,
+                "gen_id": gen_id,
+                "chunk_num": chunk_num
+            }),
+            loop
+        )
+
+    if aborted:
+        return False
+
+    playback_state["all_chunks"].extend(sentence_chunks)
 
     if sentence_chunks:
         sentence_audio = torch.cat([torch.from_numpy(c) for c in sentence_chunks])
@@ -414,11 +439,13 @@ def _generate_sentence_audio(sentence_text, turn_context, pending_audio_chunks, 
 def speak_streaming(user_text, session_id="default"):
     """Stream the LLM response and feed completed sentences to CSM as they
     arrive, so LLM decoding and TTS generation overlap instead of running
-    fully sequentially. Generated audio is buffered (never sent to the
-    client) until the full response has been generated - only then does
-    actual playback begin. If the user starts speaking again at any point
-    before or during playback, everything generated so far is discarded and
-    the pending input is processed fresh once this turn unwinds.
+    fully sequentially. Each sentence's audio is sent to the client the
+    moment CSM produces it - playback naturally begins as soon as the first
+    chunk of the first sentence is ready, which is already after the user's
+    turn has ended (generation only starts once STT has finished transcribing
+    the completed utterance). If the user starts speaking again at any point
+    - before the first chunk or mid-playback - everything in flight is
+    aborted and the pending input is processed fresh once this turn unwinds.
     """
     global config, is_speaking, pending_user_inputs, interrupt_flag, current_generation_id, speaking_start_time
 
@@ -434,10 +461,10 @@ def speak_streaming(user_text, session_id="default"):
     speaking_start_time = time.time()
 
     aborted = False
-    pending_audio_chunks = []
     turn_context = list(reference_segments)
     full_response_text = ""
     output_file = ""
+    playback_state = {"all_chunks": [], "chunk_counter": 0, "gen_id": this_id}
 
     try:
         start_model_thread()
@@ -463,31 +490,36 @@ def speak_streaming(user_text, session_id="default"):
                 sentence_buffer += delta
                 full_response_text += delta
 
+                # is_speaking flips True the moment the first sentence starts
+                # generating audio, inside _generate_sentence_audio below.
                 complete_sentences, sentence_buffer = extract_complete_sentences(sentence_buffer)
                 for sentence in complete_sentences:
-                    if not _generate_sentence_audio(sentence, turn_context, pending_audio_chunks, this_id):
+                    is_speaking = True
+                    if not _generate_sentence_audio(sentence, turn_context, playback_state, this_id):
                         aborted = True
                         break
                 if aborted:
                     break
 
             if not aborted and sentence_buffer.strip():
-                if not _generate_sentence_audio(sentence_buffer.strip(), turn_context, pending_audio_chunks, this_id):
+                is_speaking = True
+                if not _generate_sentence_audio(sentence_buffer.strip(), turn_context, playback_state, this_id):
                     aborted = True
 
+        full_response_text = full_response_text.strip()
+
         if aborted:
-            logger.info(f"Generation {this_id} - aborted before playback (user started speaking)")
+            logger.info(f"Generation {this_id} - aborted (user started speaking)")
             asyncio.run_coroutine_threadsafe(
                 message_queue.put({"type": "audio_status", "status": "interrupted", "gen_id": this_id}),
                 loop
             )
             return
 
-        full_response_text = full_response_text.strip()
         if not full_response_text:
             return
 
-        # Full response is ready - save to history/DB and notify the client of the text.
+        # Save to history/DB and notify the client of the full text once known.
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         conversation_history.append({
             "timestamp": timestamp,
@@ -522,48 +554,9 @@ def speak_streaming(user_text, session_id="default"):
             loop
         )
 
-        # ---- Playback phase: only now does generated audio reach the client ----
-        if interrupt_flag.is_set():
-            aborted = True
-        else:
-            is_speaking = True
-            speaking_start_time = time.time()
-
-            asyncio.run_coroutine_threadsafe(
-                message_queue.put({"type": "audio_status", "status": "generating", "gen_id": this_id}),
-                loop
-            )
-
-            chunk_counter = 0
-            for chunk_array in pending_audio_chunks:
-                if interrupt_flag.is_set():
-                    logger.info(f"Generation {this_id} - interrupted during playback flush")
-                    aborted = True
-                    break
-
-                chunk_counter += 1
-                audio_queue.put(chunk_array)
-
-                if chunk_counter == 1:
-                    asyncio.run_coroutine_threadsafe(
-                        message_queue.put({"type": "audio_status", "status": "first_chunk", "gen_id": this_id}),
-                        loop
-                    )
-
-                asyncio.run_coroutine_threadsafe(
-                    message_queue.put({
-                        "type": "audio_chunk",
-                        "audio": chunk_array.tolist(),
-                        "sample_rate": generator.sample_rate,
-                        "gen_id": this_id,
-                        "chunk_num": chunk_counter
-                    }),
-                    loop
-                )
-
-        if not aborted and pending_audio_chunks:
+        if playback_state["all_chunks"]:
             try:
-                complete_audio = torch.cat([torch.from_numpy(c) for c in pending_audio_chunks])
+                complete_audio = torch.cat([torch.from_numpy(c) for c in playback_state["all_chunks"]])
                 if output_file:
                     save_audio_and_trim(output_file, session_id, config.voice_speaker_id, complete_audio, generator.sample_rate)
                 add_segment(full_response_text.lower(), config.voice_speaker_id, complete_audio)
@@ -651,6 +644,7 @@ def model_worker(cfg: CompanionConfig):
                     speaker=speaker_id,
                     context=context,
                     max_audio_length_ms=max_ms,
+                    cancel_event=interrupt_flag,
                     temperature=temperature,
                     topk=topk):
                 model_result_queue.put(chunk)
@@ -909,39 +903,26 @@ def handle_interrupt(websocket):
                     audio_queue.get_nowait()
                 except queue.Empty:
                     break
-                    
+
             # Add end signal
             audio_queue.put(None)
             logger.info("Audio queue cleared")
         except Exception as e:
             logger.error(f"Error clearing audio queue: {e}")
-        
-        # Reset VAD to prepare for new input
-        if vad_processor:
-            try:
-                vad_processor.reset()
-                logger.info("VAD processor reset")
-            except Exception as e:
-                logger.error(f"Error resetting VAD: {e}")
-        
-        # Stop current model worker if needed
-        if model_thread and model_thread.is_alive():
-            try:
-                # Clear the thread running flag to stop generation
-                model_thread_running.clear()
-                
-                # Wait a brief moment for thread to notice and exit
-                time.sleep(0.1)
-                
-                # Now restart the thread state flag
-                model_thread_running.set()
-                
-                # And restart the thread
-                start_model_thread()
-                logger.info("Model thread restarted")
-            except Exception as e:
-                logger.error(f"Error restarting model thread: {e}")
-        
+
+        # NOTE: deliberately NOT calling vad_processor.reset() here. This
+        # interrupt commonly fires *while* VAD is actively collecting the
+        # user's new utterance (the one that triggered the barge-in) -
+        # resetting it mid-collection would wipe that in-progress audio
+        # buffer and truncate the very speech we're trying to respond to.
+        # VAD's own is_collecting/silent_chunk_count state machine already
+        # handles turn boundaries correctly without an external reset.
+
+        # generator.generate_stream() checks interrupt_flag itself (passed as
+        # cancel_event) and stops within about one frame, so the model worker
+        # doesn't need to be killed/restarted here - it'll pick up the next
+        # queued request on its own once the current one exits.
+
         return True
     
     logger.info("No active speech to interrupt")
