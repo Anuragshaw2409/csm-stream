@@ -35,7 +35,6 @@ ENV/
 
 # Project specific
 .python-version
-*.wav
 output_*/
 basic_audio.wav
 full_conversation.wav
