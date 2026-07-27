@@ -1,5 +1,6 @@
 import re
-from typing import List, Dict, Any, Optional
+import uuid
+from typing import Generator, List, Dict, Any, Optional
 import torch
 from vllm import LLM, SamplingParams
 
@@ -88,6 +89,55 @@ class LLMInterface:
             return self.trim_to_last_sentence(text)
         return ""
     
+    def generate_response_stream(self, system_prompt: str, user_message: str,
+                                  conversation_history: str = "") -> Generator[str, None, None]:
+        """Stream a response from the LLM, yielding incremental text deltas as they're generated.
+
+        Uses the underlying vLLM LLMEngine directly (step-by-step) instead of the
+        blocking batch `generate()` call, so callers can start consuming text (and
+        handing sentences off to TTS) before the full response is done.
+        """
+        prompt = f"""<|start_header_id|>system<|end_header_id|>\n{system_prompt}<|eot_id|>
+        {conversation_history}
+        <|start_header_id|>user<|end_header_id|>\n{user_message}<|eot_id|>
+        <|start_header_id|>assistant<|end_header_id|>\n"""
+
+        sampling_params = SamplingParams(
+            temperature=1.0,
+            top_p=0.95,
+            max_tokens=100,
+            repetition_penalty=1.2,
+            top_k=200,
+            stop=["</s>", "<|endoftext|>", "<<USR>>", "<</USR>>", "<</SYS>>",
+                  "<</USER>>", "<</ASSISTANT>>", "<|end_header_id|>", "<<ASSISTANT>>",
+                  "<|eot_id|>", "<|im_end|>", "user:", "User:", "user :", "User :"]
+        )
+
+        engine = self.llm.llm_engine
+        request_id = str(uuid.uuid4())
+        engine.add_request(request_id, prompt, sampling_params)
+
+        previous_text = ""
+        try:
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.request_id != request_id:
+                        continue
+                    full_text = output.outputs[0].text
+                    delta = full_text[len(previous_text):]
+                    previous_text = full_text
+                    if delta:
+                        yield delta
+                    if output.finished:
+                        return
+        finally:
+            # Make sure an early break (e.g. caller aborts mid-stream) doesn't
+            # leave the request alive inside the engine.
+            try:
+                engine.abort_request(request_id)
+            except Exception:
+                pass
+
     def tokenize(self, text: str) -> List[int]:
         """Tokenize text using VLLM's tokenizer.
         

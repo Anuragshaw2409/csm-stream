@@ -2,7 +2,6 @@ import asyncio
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"  
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1" 
 os.environ["PYTORCH_DISABLE_CUDA_GRAPHS"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import platform
@@ -95,6 +94,10 @@ config = None
 audio_queue = queue.Queue()
 is_speaking = False
 interrupt_flag = threading.Event()
+# Set for the entire duration of an AI turn: from the moment the LLM starts
+# streaming through the end of audio playback. Lets on_speech_start() detect
+# a barge-in even before playback has begun (while CSM is still generating).
+ai_turn_active = threading.Event()
 generator = None
 llm = None
 rag = None
@@ -250,12 +253,24 @@ def initialize_models(config_data: CompanionConfig):
 
 
 def on_speech_start():
+    global interrupt_flag
+
+    should_interrupt = False
+    if ai_turn_active.is_set():
+        time_since_turn_start = time.time() - speaking_start_time if speaking_start_time > 0 else 999
+        # Guard against the mic picking up the AI's own voice right as a turn
+        # starts and immediately self-interrupting.
+        if time_since_turn_start > MIN_BARGE_LATENCY and not interrupt_flag.is_set():
+            logger.info("User started speaking during an active AI turn - aborting generation/playback")
+            interrupt_flag.set()
+            should_interrupt = True
+
     asyncio.run_coroutine_threadsafe(
         message_queue.put(
             {
                 "type":   "vad_status",
                 "status": "speech_started",
-                "should_interrupt": False,  # always False – UI never barges-in here
+                "should_interrupt": should_interrupt,
             }
         ),
         loop,
@@ -314,78 +329,179 @@ def process_pending_inputs():
         user_text, session_id = latest_input
         process_user_input(user_text, session_id)
 
-def process_user_input(user_text, session_id="default"):
-    global config, is_speaking, pending_user_inputs, interrupt_flag
-    
-    # Skip empty messages
-    if not user_text or user_text.strip() == "":
-        logger.warning("Empty user input received, ignoring")
+_SENTENCE_SPLIT_RE = re.compile(r'(.*?[.!?])(\s+|$)', re.DOTALL)
+
+def extract_complete_sentences(buffer_text):
+    """Split off complete sentences from a growing text buffer.
+
+    Returns (list_of_complete_sentences, remainder_still_incomplete).
+    """
+    sentences = []
+    end = 0
+    for m in _SENTENCE_SPLIT_RE.finditer(buffer_text):
+        sentence = m.group(1).strip()
+        if sentence:
+            sentences.append(sentence)
+        end = m.end()
+    return sentences, buffer_text[end:]
+
+
+def _generate_sentence_audio(sentence_text, turn_context, pending_audio_chunks, gen_id):
+    """Run CSM on a single completed LLM sentence.
+
+    Appends resulting chunks to pending_audio_chunks (buffered, not sent to the
+    client yet) and appends the generated audio to turn_context so the next
+    sentence in this turn stays prosody-consistent with this one.
+
+    Returns False if generation was aborted due to a barge-in, True otherwise.
+    """
+    global model_thread_running
+
+    sentence_text = preprocess_text_for_tts(sentence_text.lower())
+    if not sentence_text:
+        return True
+
+    words = sentence_text.split()
+    estimated_seconds = len(words) / (100 / 60)  # ~100 wpm
+    max_audio_length_ms = max(int(estimated_seconds * 1000), 500)
+
+    model_queue.put((
+        sentence_text,
+        config.voice_speaker_id,
+        list(turn_context),
+        max_audio_length_ms,
+        0.8,  # temperature
+        50    # topk
+    ))
+
+    sentence_chunks = []
+    while True:
+        if interrupt_flag.is_set():
+            logger.info(f"Generation {gen_id} - interrupt detected mid-sentence, resetting model worker")
+            model_thread_running.clear()
+            time.sleep(0.1)
+            model_thread_running.set()
+            start_model_thread()
+            while not model_result_queue.empty():
+                try:
+                    model_result_queue.get_nowait()
+                except queue.Empty:
+                    break
+            return False
+
+        try:
+            result = model_result_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        if result is None:
+            break
+        if isinstance(result, Exception):
+            logger.error(f"Generation {gen_id} - sentence generation error: {result}")
+            break
+
+        sentence_chunks.append(result.cpu().numpy().astype(np.float32))
+
+    pending_audio_chunks.extend(sentence_chunks)
+
+    if sentence_chunks:
+        sentence_audio = torch.cat([torch.from_numpy(c) for c in sentence_chunks])
+        turn_context.append(Segment(text=sentence_text, speaker=config.voice_speaker_id, audio=sentence_audio))
+
+    return True
+
+
+def speak_streaming(user_text, session_id="default"):
+    """Stream the LLM response and feed completed sentences to CSM as they
+    arrive, so LLM decoding and TTS generation overlap instead of running
+    fully sequentially. Generated audio is buffered (never sent to the
+    client) until the full response has been generated - only then does
+    actual playback begin. If the user starts speaking again at any point
+    before or during playback, everything generated so far is discarded and
+    the pending input is processed fresh once this turn unwinds.
+    """
+    global config, is_speaking, pending_user_inputs, interrupt_flag, current_generation_id, speaking_start_time
+
+    if not audio_gen_lock.acquire(blocking=False):
+        logger.warning("Generation already in progress, ignoring new input")
         return
-    
+
+    current_generation_id += 1
+    this_id = current_generation_id
+
     interrupt_flag.clear()
-    is_speaking = False
-    
-    # Check if we're currently supposed to be speaking
-    if is_speaking:
-        logger.info(f"AI is currently speaking, adding input to pending queue: '{user_text}'")
-        
-        with user_input_lock:
-            # Only keep the most recent input, replacing any existing ones
-            pending_user_inputs = [(user_text, session_id)]
-            logger.info(f"Added user input as the only pending input: '{user_text}'")
-        
-        # Request interruption if not already interrupted
-        if not interrupt_flag.is_set():
-            logger.info("Automatically interrupting current speech for new input")
-            interrupt_flag.set()
-            # Notify clients of interruption
+    ai_turn_active.set()
+    speaking_start_time = time.time()
+
+    aborted = False
+    pending_audio_chunks = []
+    turn_context = list(reference_segments)
+    full_response_text = ""
+    output_file = ""
+
+    try:
+        start_model_thread()
+
+        context = "\n".join([f"User: {msg['user']}\nAI: {msg['ai']}" for msg in conversation_history[-5:]])
+        rag_context = rag.query(user_text)
+        system_prompt = config.system_prompt
+        if rag_context:
+            system_prompt += f"\n\nRelevant context:\n{rag_context}"
+
+        asyncio.run_coroutine_threadsafe(
+            message_queue.put({"type": "status", "message": "Thinking..."}),
+            loop
+        )
+
+        sentence_buffer = ""
+        with llm_lock:
+            for delta in llm.generate_response_stream(system_prompt, user_text, context):
+                if interrupt_flag.is_set():
+                    aborted = True
+                    break
+
+                sentence_buffer += delta
+                full_response_text += delta
+
+                complete_sentences, sentence_buffer = extract_complete_sentences(sentence_buffer)
+                for sentence in complete_sentences:
+                    if not _generate_sentence_audio(sentence, turn_context, pending_audio_chunks, this_id):
+                        aborted = True
+                        break
+                if aborted:
+                    break
+
+            if not aborted and sentence_buffer.strip():
+                if not _generate_sentence_audio(sentence_buffer.strip(), turn_context, pending_audio_chunks, this_id):
+                    aborted = True
+
+        if aborted:
+            logger.info(f"Generation {this_id} - aborted before playback (user started speaking)")
             asyncio.run_coroutine_threadsafe(
-                message_queue.put({"type": "audio_status", "status": "interrupted"}),
+                message_queue.put({"type": "audio_status", "status": "interrupted", "gen_id": this_id}),
                 loop
             )
-            
-            # Allow a short delay before processing the new input
-            time.sleep(0.3)
-            
-            # Process the pending input after interruption
-            process_pending_inputs()
-        
-        return
-    
-    interrupt_flag.clear()
-    
-    # Normal processing continues...
-    logger.info(f"Processing user input: '{user_text}'")
-    context = "\n".join([f"User: {msg['user']}\nAI: {msg['ai']}" for msg in conversation_history[-5:]])
-    rag_context = rag.query(user_text)
-    system_prompt = config.system_prompt
-    if rag_context:
-        system_prompt += f"\n\nRelevant context:\n{rag_context}"
+            return
 
-    # Notify clients that we're thinking
-    asyncio.run_coroutine_threadsafe(
-        message_queue.put({"type": "status", "message": "Thinking..."}),
-        loop
-    )
-    
-    try:
-        with llm_lock: 
-            ai_response = llm.generate_response(system_prompt, user_text, context)
-        
+        full_response_text = full_response_text.strip()
+        if not full_response_text:
+            return
+
+        # Full response is ready - save to history/DB and notify the client of the text.
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         conversation_history.append({
             "timestamp": timestamp,
             "user": user_text,
-            "ai": ai_response
+            "ai": full_response_text
         })
-        
+
         try:
             db = SessionLocal()
             conv = Conversation(
                 session_id=session_id,
                 timestamp=timestamp,
                 user_message=user_text,
-                ai_message=ai_response,
+                ai_message=full_response_text,
                 audio_path=""
             )
             db.add(conv)
@@ -398,43 +514,117 @@ def process_user_input(user_text, session_id="default"):
             db.close()
         except Exception as e:
             logger.error(f"Database error: {e}")
-        
-        threading.Thread(target=lambda: rag.add_conversation(user_text, ai_response), daemon=True).start()
-        
+
+        threading.Thread(target=lambda: rag.add_conversation(user_text, full_response_text), daemon=True).start()
+
         asyncio.run_coroutine_threadsafe(
-            message_queue.put({"type": "audio_status", "status": "preparing"}),
-            loop
-        )
-        
-        # Small delay to ensure client is ready
-        time.sleep(0.2)
-        
-        # Send the response to clients
-        asyncio.run_coroutine_threadsafe(
-            message_queue.put({"type": "response", "text": ai_response}),
+            message_queue.put({"type": "response", "text": full_response_text}),
             loop
         )
 
-        time.sleep(0.5)
-        
-        if is_speaking:
-            logger.warning("Still speaking when trying to start new audio - forcing interrupt")
-            interrupt_flag.set()
-            is_speaking = False
-            time.sleep(0.5)  # Give time for cleanup
-        
-        interrupt_flag.clear()  # Make absolutely sure
-        is_speaking = False    # Reset for audio thread to take over
-        
-        # Start audio generation in a new thread
-        threading.Thread(target=audio_generation_thread, args=(ai_response, output_file), daemon=True).start()
+        # ---- Playback phase: only now does generated audio reach the client ----
+        if interrupt_flag.is_set():
+            aborted = True
+        else:
+            is_speaking = True
+            speaking_start_time = time.time()
+
+            asyncio.run_coroutine_threadsafe(
+                message_queue.put({"type": "audio_status", "status": "generating", "gen_id": this_id}),
+                loop
+            )
+
+            chunk_counter = 0
+            for chunk_array in pending_audio_chunks:
+                if interrupt_flag.is_set():
+                    logger.info(f"Generation {this_id} - interrupted during playback flush")
+                    aborted = True
+                    break
+
+                chunk_counter += 1
+                audio_queue.put(chunk_array)
+
+                if chunk_counter == 1:
+                    asyncio.run_coroutine_threadsafe(
+                        message_queue.put({"type": "audio_status", "status": "first_chunk", "gen_id": this_id}),
+                        loop
+                    )
+
+                asyncio.run_coroutine_threadsafe(
+                    message_queue.put({
+                        "type": "audio_chunk",
+                        "audio": chunk_array.tolist(),
+                        "sample_rate": generator.sample_rate,
+                        "gen_id": this_id,
+                        "chunk_num": chunk_counter
+                    }),
+                    loop
+                )
+
+        if not aborted and pending_audio_chunks:
+            try:
+                complete_audio = torch.cat([torch.from_numpy(c) for c in pending_audio_chunks])
+                if output_file:
+                    save_audio_and_trim(output_file, session_id, config.voice_speaker_id, complete_audio, generator.sample_rate)
+                add_segment(full_response_text.lower(), config.voice_speaker_id, complete_audio)
+
+                total_audio_seconds = complete_audio.size(0) / generator.sample_rate
+                logger.info(f"Generation {this_id} - played {total_audio_seconds:.2f}s of audio")
+            except Exception as e:
+                logger.error(f"Generation {this_id} - error saving complete audio: {e}")
 
     except Exception as e:
-        logger.error(f"Error generating response: {e}")
+        import traceback
+        logger.error(f"Generation {this_id} - unexpected error: {e}\n{traceback.format_exc()}")
         asyncio.run_coroutine_threadsafe(
             message_queue.put({"type": "error", "message": "Failed to generate response"}),
             loop
         )
+    finally:
+        is_speaking = False
+        ai_turn_active.clear()
+        audio_queue.put(None)
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                message_queue.put({"type": "audio_status", "status": "complete", "gen_id": this_id}),
+                loop
+            )
+        except Exception as e:
+            logger.error(f"Generation {this_id} - failed to send completion status: {e}")
+
+        with user_input_lock:
+            if pending_user_inputs:
+                logger.info(f"Generation {this_id} - processing pending input queued during this turn")
+                process_pending_inputs()
+
+        audio_gen_lock.release()
+
+
+def process_user_input(user_text, session_id="default"):
+    global pending_user_inputs, interrupt_flag
+
+    if not user_text or user_text.strip() == "":
+        logger.warning("Empty user input received, ignoring")
+        return
+
+    if ai_turn_active.is_set():
+        logger.info(f"AI turn in progress, replacing pending input with: '{user_text}'")
+
+        with user_input_lock:
+            pending_user_inputs = [(user_text, session_id)]
+
+        if not interrupt_flag.is_set():
+            logger.info("Interrupting current generation/speech for new input")
+            interrupt_flag.set()
+            asyncio.run_coroutine_threadsafe(
+                message_queue.put({"type": "audio_status", "status": "interrupted"}),
+                loop
+            )
+        return
+
+    logger.info(f"Processing user input: '{user_text}'")
+    threading.Thread(target=speak_streaming, args=(user_text, session_id), daemon=True).start()
 
 def model_worker(cfg: CompanionConfig):
     global generator, model_thread_running
@@ -492,10 +682,6 @@ def start_model_thread():
                                     name="model_worker")
     model_thread.start()
     logger.info("Started dedicated model worker thread")
-
-async def run_audio_generation(text, output_file):
-    """Async wrapper for audio generation that runs in the event loop thread"""
-    audio_generation_thread(text, output_file)
 
 def send_to_all_clients(message: dict):
     """Send a message to all connected WebSocket clients"""
@@ -667,229 +853,6 @@ def preprocess_text_for_tts(text):
     cleaned_text = re.sub(r'([.,!?])(\S)', r'\1 \2', cleaned_text)
     return cleaned_text.strip()
 
-def audio_generation_thread(text, output_file):
-    global is_speaking, interrupt_flag, audio_queue, model_thread_running, current_generation_id, speaking_start_time
-    
-    current_generation_id += 1
-    this_id = current_generation_id
-    
-    interrupt_flag.clear()
-    
-    # Log the start of generation
-    logger.info(f"Starting audio generation for ID: {this_id}")
-    
-    # Try to acquire the lock, but don't block if it's busy
-    if not audio_gen_lock.acquire(blocking=False):
-        logger.warning(f"Audio generation {this_id} - lock acquisition failed, another generation is in progress")
-        asyncio.run_coroutine_threadsafe(
-            message_queue.put({
-                "type": "error", 
-                "message": "Audio generation busy, skipping synthesis",
-                "gen_id": this_id
-            }),
-            loop
-        )
-        return
-    
-    try:
-        # Start the model thread if it's not already running
-        start_model_thread()
-        
-        interrupt_flag.clear()
-        is_speaking = True
-        speaking_start_time = time.time()
-        
-        # Create output directory
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        all_audio_chunks = []
-        
-        # Prepare text
-        text_lower = text.lower()
-        text_lower = preprocess_text_for_tts(text_lower)
-        
-        asyncio.run_coroutine_threadsafe(
-            message_queue.put({
-                "type": "audio_status", 
-                "status": "preparing_generation",
-                "gen_id": this_id
-            }),
-            loop
-        )
-        
-        # Give client a moment to process
-        time.sleep(0.2)
-        
-        logger.info(f"Sending generating status with ID {this_id}")
-        asyncio.run_coroutine_threadsafe(
-            message_queue.put({
-                "type": "audio_status", 
-                "status": "generating",
-                "gen_id": this_id  # Include generation ID
-            }),
-            loop
-        )
-        
-        # Small delay to ensure client gets the signal
-        time.sleep(0.2)
-        
-        # Estimate audio length
-        words = text.split()
-        avg_wpm = 100
-        words_per_second = avg_wpm / 60
-        estimated_seconds = len(words) / words_per_second
-        max_audio_length_ms = int(estimated_seconds * 1000)
-        
-        # Send request to model thread
-        logger.info(f"Audio generation {this_id} - sending request to model thread")
-        model_queue.put((
-            text_lower,
-            config.voice_speaker_id,
-            reference_segments,
-            max_audio_length_ms,
-            0.8,  # temperature
-            50    # topk
-        ))
-        
-        # Start timing
-        generation_start = time.time()
-        chunk_counter = 0
-        
-        # Process results as they come
-        while True:
-            try:
-                # Check for interruption FIRST before getting more results
-                if interrupt_flag.is_set():
-                    logger.info(f"Audio generation {this_id} - interrupt detected, stopping")
-                    
-                    # Signal model thread to exit and restart
-                    model_thread_running.clear()
-                    time.sleep(0.1)
-                    model_thread_running.set()
-                    start_model_thread()
-                    
-                    # Clear any remaining items in the result queue
-                    while not model_result_queue.empty():
-                        try:
-                            model_result_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                    
-                    # Break out of the processing loop
-                    break
-                
-                # Get result with timeout to allow checking interrupt
-                result = model_result_queue.get(timeout=0.1)
-                
-                # Check for end of generation or error
-                if result is None:
-                    logger.info(f"Audio generation {this_id} - complete")
-                    break
-                    
-                if isinstance(result, Exception):
-                    logger.error(f"Audio generation {this_id} - error: {result}")
-                    raise result
-                
-                # Track timing for first chunk
-                if chunk_counter == 0:
-                    first_chunk_time = time.time() - generation_start
-                    logger.info(f"Audio generation {this_id} - first chunk latency: {first_chunk_time*1000:.1f}ms")
-                
-                chunk_counter += 1
-                
-                # One more interrupt check before processing chunk
-                if interrupt_flag.is_set():
-                    logger.info(f"Audio generation {this_id} - interrupt flag set during chunk processing")
-                    break
-                
-                # Process this audio chunk
-                audio_chunk = result
-                all_audio_chunks.append(audio_chunk)
-                
-                # Convert to numpy and send to audio queue
-                chunk_array = audio_chunk.cpu().numpy().astype(np.float32)
-                audio_queue.put(chunk_array)
-                
-                if chunk_counter == 1:
-                    logger.info(f"Sending first audio chunk with ID {this_id}")
-                    # Notify client we're sending the first chunk
-                    asyncio.run_coroutine_threadsafe(
-                        message_queue.put({
-                            "type": "audio_status", 
-                            "status": "first_chunk",
-                            "gen_id": this_id
-                        }),
-                        loop
-                    )
-                    # Small delay
-                    time.sleep(0.1)
-                
-                # Send chunk with generation ID
-                asyncio.run_coroutine_threadsafe(
-                    message_queue.put({
-                        "type": "audio_chunk",
-                        "audio": chunk_array.tolist(),
-                        "sample_rate": generator.sample_rate,
-                        "gen_id": this_id,
-                        "chunk_num": chunk_counter  # Include chunk number
-                    }),
-                    loop
-                )
-                
-            except queue.Empty:
-                # No results yet, keep checking
-                continue
-            except Exception as e:
-                logger.error(f"Audio generation {this_id} - error processing result: {e}")
-                break
-        
-        # Save complete audio if available
-        if all_audio_chunks and not interrupt_flag.is_set():
-            try:
-                complete_audio = torch.cat(all_audio_chunks)
-                save_audio_and_trim(output_file, "default", config.voice_speaker_id, complete_audio, generator.sample_rate)
-                add_segment(text.lower(), config.voice_speaker_id, complete_audio)
-                
-                # Log statistics
-                total_time = time.time() - generation_start
-                total_audio_seconds = complete_audio.size(0) / generator.sample_rate
-                rtf = total_time / total_audio_seconds
-                logger.info(f"Audio generation {this_id} - completed in {total_time:.2f}s, RTF: {rtf:.2f}x")
-            except Exception as e:
-                logger.error(f"Audio generation {this_id} - error saving complete audio: {e}")
-                
-    except Exception as e:
-        import traceback
-        logger.error(f"Audio generation {this_id} - unexpected error: {e}\n{traceback.format_exc()}")
-    finally:
-        is_speaking = False
-        
-        # Signal end of audio
-        audio_queue.put(None)
-        
-        try:
-            logger.info(f"Audio generation {this_id} - sending completion status")
-            asyncio.run_coroutine_threadsafe(
-                message_queue.put({
-                    "type": "audio_status", 
-                    "status": "complete",
-                    "gen_id": this_id
-                }),
-                loop
-            )
-        except Exception as e:
-            logger.error(f"Audio generation {this_id} - failed to send completion status: {e}")
-            
-        # Process any pending inputs
-        with user_input_lock:
-            if pending_user_inputs:
-                # Process pending inputs
-                logger.info(f"Audio generation {this_id} - processing pending inputs")
-                process_pending_inputs()
-            
-        # Release the lock
-        logger.info(f"Audio generation {this_id} - releasing lock")
-        audio_gen_lock.release()
-    
 def handle_interrupt(websocket):
     global is_speaking, last_interrupt_time, interrupt_flag, model_thread_running, speaking_start_time
     
@@ -918,8 +881,8 @@ def handle_interrupt(websocket):
     # Update the last interrupt time
     last_interrupt_time = current_time
     
-    # We should interrupt if we're speaking OR if model generation is in progress
-    if is_speaking or not model_result_queue.empty():
+    # We should interrupt if we're speaking, generating (even pre-playback), or model generation is in progress
+    if is_speaking or ai_turn_active.is_set() or not model_result_queue.empty():
         logger.info("Interruption processing: we are speaking or generating")
         
         interrupt_flag.set()
