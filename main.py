@@ -369,8 +369,8 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
         return True
 
     words = sentence_text.split()
-    estimated_seconds = len(words) / (100 / 60)  # ~100 wpm
-    max_audio_length_ms = max(int(estimated_seconds * 1000), 500)
+    estimated_seconds = len(words) / (85 / 60)  # ~85 wpm, slower than typical speech to leave pacing headroom
+    max_audio_length_ms = max(int(estimated_seconds * 1000 * 1.6), 1500)  # 60% buffer + floor for pauses/short sentences
 
     model_queue.put((
         sentence_text,
@@ -936,7 +936,7 @@ def handle_interrupt(websocket):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global is_speaking, audio_queue
+    global is_speaking, audio_queue, pending_user_inputs
     
     await websocket.accept()
     active_connections.append(websocket)
