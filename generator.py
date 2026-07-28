@@ -233,26 +233,34 @@ class Generator:
             i = 0
             generation_start = time.time()
 
+            natural_eos = False
+            hit_cap = True  # assumed unless a break below proves otherwise
+
             while i < max_generation_len:
                 if cancel_event is not None and cancel_event.is_set():
                     logger.info("generate_stream cancelled, stopping early.")
+                    hit_cap = False
                     break
 
                 # curr_pos indexes into a fixed-size (max_seq_len) causal mask;
                 # stop before it would run out of bounds and crash the CUDA kernel.
                 if curr_pos.max().item() + 1 >= self.max_seq_len:
                     logger.warning("Reached model max_seq_len during generation, stopping early.")
+                    hit_cap = False
                     break
 
                 batch_end = min(i + batch_size, max_generation_len)
                 batch_size_actual = batch_end - i
 
                 batch_samples = []
+                stop_batch = False
 
                 for _ in range(batch_size_actual):
                     if cancel_event is not None and cancel_event.is_set():
+                        stop_batch = True
                         break
                     if curr_pos.max().item() + 1 >= self.max_seq_len:
+                        stop_batch = True
                         break
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                         sample = self._model.generate_frame(
@@ -264,21 +272,34 @@ class Generator:
                                 torch.cuda.synchronize()  # Force sync before checking
                                 if sample.numel() == 0 or torch.isnan(sample).any():
                                     print("Warning: Generated empty or NaN sample, stopping generation")
+                                    stop_batch = True
                                     break
                             except:
                                 print("Error checking tensor, stopping generation")
+                                stop_batch = True
                                 break
                     if torch.all(sample == 0):
+                        # Model's own end-of-speech signal - stop the whole
+                        # generation here, not just this batch, otherwise the
+                        # frame is silently discarded and generation keeps
+                        # going past the point the model considered "done".
+                        natural_eos = True
+                        stop_batch = True
                         break
 
                     batch_samples.append(sample)
                     update_tokens(sample)
 
-                if not batch_samples:
-                    break
-
                 frame_buffer.extend(batch_samples)
                 i += len(batch_samples)
+
+                if natural_eos:
+                    hit_cap = False
+                    break
+
+                if not batch_samples and stop_batch:
+                    hit_cap = False
+                    break
 
                 if len(frame_buffer) >= buffer_size:
                     frames_to_process = frame_buffer[:expected_frame_count]
@@ -320,31 +341,33 @@ class Generator:
                             torch.cuda.synchronize()
                         print(f"Generated {i} frames ({i * 0.08:.2f}s of audio)")
 
-            # Process any remaining frames
+            # Process any remaining frames. Pad up to the next multiple of
+            # expected_frame_count (rather than truncating down to one, which
+            # used to silently drop real trailing frames whenever more than
+            # expected_frame_count frames were left over) and trim the
+            # padding back out of the decoded audio afterward.
             if frame_buffer:
-                # Pad frame buffer if necessary
-                if len(frame_buffer) < expected_frame_count:
+                remainder = len(frame_buffer) % expected_frame_count
+                if remainder != 0:
                     padding_frames = [
-                        torch.zeros_like(frame_buffer[0]) 
-                        for _ in range(expected_frame_count - len(frame_buffer))
+                        torch.zeros_like(frame_buffer[0])
+                        for _ in range(expected_frame_count - remainder)
                     ]
                     frames_to_process = frame_buffer + padding_frames
                 else:
-                    # Otherwise take as many frames as possible that are a multiple of expected_frame_count
-                    frames_multiple = (len(frame_buffer) // expected_frame_count) * expected_frame_count
-                    frames_to_process = frame_buffer[:frames_multiple]
-                    
+                    frames_to_process = frame_buffer
+
                 frames_stacked = torch.stack(frames_to_process).permute(1, 2, 0)
                 audio_chunk = self._audio_tokenizer.decode(frames_stacked).squeeze(0).squeeze(0)
-                
+
                 # Determine actual audio length (before padding)
-                actual_frames_percentage = min(len(frame_buffer), expected_frame_count) / expected_frame_count
+                actual_frames_percentage = len(frame_buffer) / len(frames_to_process)
                 actual_samples = int(audio_chunk.shape[0] * actual_frames_percentage)
-                
+
                 # Return only the non-padded portion of audio if we added padding
-                if len(frame_buffer) < expected_frame_count:
+                if len(frame_buffer) < len(frames_to_process):
                     audio_chunk = audio_chunk[:actual_samples]
-                    
+
                 cpu_chunk = audio_chunk.cpu()
                 if on_chunk_generated:
                     on_chunk_generated(cpu_chunk)
@@ -360,6 +383,11 @@ class Generator:
             print(f"Total time: {total_time:.2f}s")
             print(f"Generated {frames_generated} frames ({audio_seconds:.2f}s of audio)")
             print(f"Real-time factor: {rtf:.3f}x (target: <1.0)")
+            if hit_cap:
+                logger.warning(
+                    f"generate_stream hit max_audio_length_ms cap ({max_audio_length_ms:.0f}ms / "
+                    f"{max_generation_len} frames) before the model naturally finished - audio was likely truncated."
+                )
 
     @torch.inference_mode()
     def generate(
