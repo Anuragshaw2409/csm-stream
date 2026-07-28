@@ -592,10 +592,13 @@ def speak_streaming(user_text, session_id="default"):
         # lock, which would otherwise always fail while we still hold it here.
         audio_gen_lock.release()
 
-        with user_input_lock:
-            if pending_user_inputs:
-                logger.info(f"Generation {this_id} - processing pending input queued during this turn")
-                process_pending_inputs()
+        # Don't hold user_input_lock here: process_pending_inputs() acquires it
+        # itself, and threading.Lock is non-reentrant, so nesting it would
+        # deadlock this thread (and freeze the whole app, since the lock is
+        # also taken synchronously inside the websocket event loop).
+        if pending_user_inputs:
+            logger.info(f"Generation {this_id} - processing pending input queued during this turn")
+            process_pending_inputs()
 
 
 def process_user_input(user_text, session_id="default"):
