@@ -151,7 +151,8 @@ def load_reference_segments(config_data: CompanionConfig):
     if os.path.isfile(config_data.reference_audio_path):
         logger.info(f"Loading primary reference audio: {config_data.reference_audio_path}")
         wav, sr = torchaudio.load(config_data.reference_audio_path)
-        wav = torchaudio.functional.resample(wav.squeeze(0),
+        wav = wav.mean(dim=0) if wav.size(0) > 1 else wav.squeeze(0)
+        wav = torchaudio.functional.resample(wav,
                                          orig_freq=sr,
                                          new_freq=24_000)
         reference_segments.append(Segment(text=config_data.reference_text,
@@ -164,7 +165,8 @@ def load_reference_segments(config_data: CompanionConfig):
     if config_data.reference_audio_path2 and os.path.isfile(config_data.reference_audio_path2):
         logger.info(f"Loading second reference audio: {config_data.reference_audio_path2}")
         wav, sr = torchaudio.load(config_data.reference_audio_path2)
-        wav = torchaudio.functional.resample(wav.squeeze(0),
+        wav = wav.mean(dim=0) if wav.size(0) > 1 else wav.squeeze(0)
+        wav = torchaudio.functional.resample(wav,
                                          orig_freq=sr,
                                          new_freq=24_000)
         reference_segments.append(Segment(text=config_data.reference_text2,
@@ -175,7 +177,8 @@ def load_reference_segments(config_data: CompanionConfig):
     if config_data.reference_audio_path3 and os.path.isfile(config_data.reference_audio_path3):
         logger.info(f"Loading third reference audio: {config_data.reference_audio_path3}")
         wav, sr = torchaudio.load(config_data.reference_audio_path3)
-        wav = torchaudio.functional.resample(wav.squeeze(0),
+        wav = wav.mean(dim=0) if wav.size(0) > 1 else wav.squeeze(0)
+        wav = torchaudio.functional.resample(wav,
                                          orig_freq=sr,
                                          new_freq=24_000)
         reference_segments.append(Segment(text=config_data.reference_text3,

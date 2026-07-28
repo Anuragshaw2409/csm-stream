@@ -20,7 +20,7 @@ Our fork adds **streaming audio generation**, **real-time playback**, and **perf
 ### Setup
 
 ```bash
-sudo apt-get update && sudo apt-get install -y libportaudio2 libportaudio-dev
+sudo apt-get update && sudo apt-get install -y libportaudio2 portaudio19-dev
 git clone git@github.com:davidbrowne17/csm-streaming.git
 cd csm-streaming
 python3.10 -m venv .venv
