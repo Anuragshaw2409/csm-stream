@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -98,6 +99,10 @@ interrupt_flag = threading.Event()
 ai_turn_active = threading.Event()
 generator = None
 llm = None
+# Set from --openrouter-api-key / --openrouter-model at startup (see __main__);
+# initialize_models() reads these when constructing the LLMInterface.
+openrouter_api_key = None
+openrouter_model = "google/gemma-4-31b-it:exacto"
 rag = None
 vad_processor = None
 reference_segments = []
@@ -205,11 +210,12 @@ def transcribe_audio(audio_data, sample_rate):
 
 def initialize_models(config_data: CompanionConfig):
     global generator, llm, rag, vad_processor, config
-    config = config_data                         
+    config = config_data
 
-    logger.info("Loading LLM …")
-    llm = LLMInterface(config_data.llm_path,
-                       config_data.max_tokens)
+    logger.info(f"Loading LLM (OpenRouter model: {openrouter_model}) …")
+    llm = LLMInterface(api_key=openrouter_api_key,
+                       model=openrouter_model,
+                       max_tokens=config_data.max_tokens)
 
     logger.info("Loading RAG …")
     rag = RAGSystem("companion.db",
@@ -473,6 +479,11 @@ def speak_streaming(user_text, session_id="default"):
         context = "\n".join([f"User: {msg['user']}\nAI: {msg['ai']}" for msg in conversation_history[-5:]])
         rag_context = rag.query(user_text)
         system_prompt = config.system_prompt
+        system_prompt += ("\n\nSpeak naturally, like a real person thinking out loud. "
+                          "Sprinkle in occasional filler words and verbal habits "
+                          "(e.g. \"um\", \"uh\", \"like\", \"you know\", \"I mean\", \"well\") "
+                          "where a person would actually pause or hedge - don't overdo it, "
+                          "and never use them at the very start of a reply.")
         if rag_context:
             system_prompt += f"\n\nRelevant context:\n{rag_context}"
 
@@ -1158,5 +1169,15 @@ async def crud_ui(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="CSM streaming companion server")
+    parser.add_argument("--openrouter-api-key", type=str, required=True,
+                        help="API key for OpenRouter, used to call the LLM (default model: google/gemma-4-31b-it:exacto)")
+    parser.add_argument("--openrouter-model", type=str, default="google/gemma-4-31b-it:exacto",
+                        help="OpenRouter model slug to use for chat generation")
+    args = parser.parse_args()
+    openrouter_api_key = args.openrouter_api_key
+    openrouter_model = args.openrouter_model
+
     threading.Thread(target=lambda: asyncio.run(loop.run_forever()), daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)

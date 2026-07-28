@@ -1,217 +1,89 @@
-import re
-import uuid
-from typing import Generator, List, Dict, Any, Optional
-import torch
-from vllm import LLM, SamplingParams
+import json
+import logging
+from typing import Generator
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
 
 class LLMInterface:
-    def __init__(self, model_path: str, max_tokens: int = 8192, n_threads: int = 8, gpu_layers: int = -1):
-        """Initialize the LLM interface using VLLM with a given model.
-        
-        Args:
-            model_path (str): Path to the model or HuggingFace model name
-            max_tokens (int, optional): Maximum context length. Defaults to 8192.
-            n_threads (int, optional): Number of CPU threads. Defaults to 8.
-            gpu_layers (int, optional): Not used in VLLM, maintained for API compatibility.
-        """
-        # VLLM configuration
-        self.llm = LLM(
-            model=model_path,
-            tensor_parallel_size=1,  # Adjust based on number of GPUs available
-            gpu_memory_utilization=0.25,
-            max_model_len=max_tokens,
-            swap_space=0,
-            trust_remote_code=True,
-            dtype=torch.float16,
-        )
-        
-        # Store configuration for reference
-        self.config = {
-            "model_path": model_path,
-            "max_tokens": max_tokens,
-        }
-        
-    def trim_to_last_sentence(self, text: str) -> str:        
-        """
-        Return *text* truncated at the final full sentence boundary.
-        A boundary is considered to be any '.', '!' or '?' followed by
-        optional quotes/brackets, optional whitespace, and then end-of-string.
+    def __init__(self, api_key: str, model: str = "google/gemma-4-31b-it:exacto",
+                 max_tokens: int = 8192, response_max_tokens: int = 200):
+        """Chat-completion LLM backend that talks to a model hosted on OpenRouter.
 
-        If no sentence terminator exists, the original text is returned.
-        """
-        # Regex explanation:
-        #   (.*?[.!?]["')\]]?)   any text lazily until a terminator
-        #   \s*$                 followed only by whitespace till end-of-string
-        m = re.match(r"^(.*?[.!?][\"')\]]?)\s*$", text, re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        # Fall back to manual search (handles cases with additional text)
-        for i in range(len(text) - 1, -1, -1):
-            if text[i] in ".!?":
-                return text[: i + 1].strip()
-        return text.strip()
-    
-    def generate_response(self, system_prompt: str, user_message: str, conversation_history: str = "") -> str:
-        """Generate a response from the LLM using chat-style prompt formatting.
-        
         Args:
-            system_prompt (str): The system prompt/instructions
-            user_message (str): The user's input message
-            conversation_history (str, optional): Any prior conversation context. Defaults to "".
-            
-        Returns:
-            str: The generated response
+            api_key: OpenRouter API key.
+            model: OpenRouter model slug to use for generation.
+            max_tokens: Context length budget (informational; OpenRouter enforces
+                the model's own context window server-side).
+            response_max_tokens: Max tokens to generate per reply.
         """
-        # Format prompt following chat template structure
-        prompt = f"""<|start_header_id|>system<|end_header_id|>\n{system_prompt}<|eot_id|>
-        {conversation_history}
-        <|start_header_id|>user<|end_header_id|>\n{user_message}<|eot_id|>
-        <|start_header_id|>assistant<|end_header_id|>\n"""
-        
-        # Define sampling parameters (equivalent to the previous implementation)
-        sampling_params = SamplingParams(
-            temperature=1.0,
-            top_p=0.95,
-            max_tokens=100,
-            repetition_penalty=1.2,
-            top_k=200,
-            stop=["</s>", "<|endoftext|>", "<<USR>>", "<</USR>>", "<</SYS>>", 
-                  "<</USER>>", "<</ASSISTANT>>", "<|end_header_id|>", "<<ASSISTANT>>", 
-                  "<|eot_id|>", "<|im_end|>", "user:", "User:", "user :", "User :"]
-        )
-        
-        # Generate response using VLLM
-        outputs = self.llm.generate(prompt, sampling_params)
-        
-        # Extract and return the generated text
-        if outputs and len(outputs) > 0:
-            text = outputs[0].outputs[0].text
-            return self.trim_to_last_sentence(text)
-        return ""
-    
+        if not api_key:
+            raise ValueError("OpenRouter API key is required to initialize LLMInterface")
+
+        self.api_key = api_key
+        self.model = model
+        self.max_tokens = max_tokens
+        self.response_max_tokens = response_max_tokens
+        self.session = requests.Session()
+
+    def _build_messages(self, system_prompt: str, user_message: str, conversation_history: str = ""):
+        messages = [{"role": "system", "content": system_prompt}]
+        if conversation_history:
+            messages.append({"role": "system", "content": f"Conversation so far:\n{conversation_history}"})
+        messages.append({"role": "user", "content": user_message})
+        return messages
+
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def generate_response(self, system_prompt: str, user_message: str, conversation_history: str = "") -> str:
+        """Generate a full (non-streaming) response from the OpenRouter model."""
+        payload = {
+            "model": self.model,
+            "messages": self._build_messages(system_prompt, user_message, conversation_history),
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": self.response_max_tokens,
+        }
+        response = self.session.post(OPENROUTER_CHAT_URL, headers=self._headers(), json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+
     def generate_response_stream(self, system_prompt: str, user_message: str,
                                   conversation_history: str = "") -> Generator[str, None, None]:
-        """Stream a response from the LLM, yielding incremental text deltas as they're generated.
-
-        Uses the underlying vLLM LLMEngine directly (step-by-step) instead of the
-        blocking batch `generate()` call, so callers can start consuming text (and
-        handing sentences off to TTS) before the full response is done.
-        """
-        prompt = f"""<|start_header_id|>system<|end_header_id|>\n{system_prompt}<|eot_id|>
-        {conversation_history}
-        <|start_header_id|>user<|end_header_id|>\n{user_message}<|eot_id|>
-        <|start_header_id|>assistant<|end_header_id|>\n"""
-
-        sampling_params = SamplingParams(
-            temperature=1.0,
-            top_p=0.95,
-            max_tokens=100,
-            repetition_penalty=1.2,
-            top_k=200,
-            stop=["</s>", "<|endoftext|>", "<<USR>>", "<</USR>>", "<</SYS>>",
-                  "<</USER>>", "<</ASSISTANT>>", "<|end_header_id|>", "<<ASSISTANT>>",
-                  "<|eot_id|>", "<|im_end|>", "user:", "User:", "user :", "User :"]
-        )
-
-        engine = self.llm.llm_engine
-        request_id = str(uuid.uuid4())
-        engine.add_request(request_id, prompt, sampling_params)
-
-        previous_text = ""
-        try:
-            while engine.has_unfinished_requests():
-                for output in engine.step():
-                    if output.request_id != request_id:
-                        continue
-                    full_text = output.outputs[0].text
-                    delta = full_text[len(previous_text):]
-                    previous_text = full_text
-                    if delta:
-                        yield delta
-                    if output.finished:
-                        return
-        finally:
-            # Make sure an early break (e.g. caller aborts mid-stream) doesn't
-            # leave the request alive inside the engine.
-            try:
-                engine.abort_request(request_id)
-            except Exception:
-                pass
-
-    def tokenize(self, text: str) -> List[int]:
-        """Tokenize text using VLLM's tokenizer.
-        
-        Args:
-            text (str): Text to tokenize
-            
-        Returns:
-            List[int]: List of token IDs
-        """
-        # VLLM doesn't expose tokenizer directly in the same way
-        # We can access the tokenizer through the LLM instance
-        tokenizer = self.llm.get_tokenizer()
-        return tokenizer.encode(text)
-    
-    def get_token_count(self, text: str) -> int:
-        """Return token count of the input text.
-        
-        Args:
-            text (str): Text to count tokens for
-            
-        Returns:
-            int: Number of tokens
-        """
-        return len(self.tokenize(text))
-    
-    def batch_generate(self, prompts: List[Dict[str, str]], 
-                       max_tokens: int = 512, 
-                       temperature: float = 0.7) -> List[str]:
-        """Generate responses for multiple prompts in a batch.        
-        Args:
-            prompts (List[Dict[str, str]]): List of prompt dictionaries, each with 
-                                           'system', 'user' and optional 'history' keys
-            max_tokens (int, optional): Maximum tokens to generate per response
-            temperature (float, optional): Temperature for sampling
-            
-        Returns:
-            List[str]: Generated responses
-        """
-        formatted_prompts = []
-        
-        # Format each prompt according to the chat template
-        for p in prompts:
-            system = p.get("system", "")
-            user = p.get("user", "")
-            history = p.get("history", "")
-            
-            formatted_prompt = f"""<|start_header_id|>system<|end_header_id|>\n{system}<|eot_id|>
-            {history}
-            <|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|>
-            <|start_header_id|>assistant<|end_header_id|>\n"""
-            
-            formatted_prompts.append(formatted_prompt)
-        
-        # Set up batch sampling parameters
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=0.95,
-            max_tokens=max_tokens,
-            repetition_penalty=1.2,
-            top_k=400,
-            stop=["</s>", "<|endoftext|>", "<<USR>>", "<</USR>>", "<</SYS>>", 
-                  "<</USER>>", "<</ASSISTANT>>", "<|end_header_id|>", "<<ASSISTANT>>", 
-                  "<|eot_id|>", "<|im_end|>", "user:", "User:", "user :", "User :"]
-        )
-        
-        # Generate responses for all prompts in a batch
-        outputs = self.llm.generate(formatted_prompts, sampling_params)
-        
-        # Extract and return the generated texts
-        results = []
-        for output in outputs:
-            if output.outputs:
-                results.append(output.outputs[0].text.strip())
-            else:
-                results.append("")
-                
-        return results
+        """Stream a response from the OpenRouter model, yielding incremental text deltas."""
+        payload = {
+            "model": self.model,
+            "messages": self._build_messages(system_prompt, user_message, conversation_history),
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "max_tokens": self.response_max_tokens,
+            "stream": True,
+        }
+        with self.session.post(OPENROUTER_CHAT_URL, headers=self._headers(), json=payload,
+                                stream=True, timeout=60) as response:
+            response.raise_for_status()
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    return
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}).get("content")
+                if delta:
+                    yield delta
