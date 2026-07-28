@@ -352,6 +352,32 @@ def extract_complete_sentences(buffer_text):
         end = m.end()
     return sentences, buffer_text[end:]
 
+_CLAUSE_BOUNDARY_RE = re.compile(r'(?<=[,;—–])\s*')
+
+def _split_long_sentence(sentence, max_words=22):
+    """Break an unusually long sentence (no . ! ? yet - e.g. several comma or
+    dash-joined clauses) into smaller chunks at clause boundaries.
+
+    A single oversized multi-clause TTS call both tightens the word-count-based
+    max_audio_length_ms estimate and makes the model more likely to predict a
+    spurious early end-of-speech frame, cutting the utterance off mid-way.
+    """
+    if len(sentence.split()) <= max_words:
+        return [sentence]
+
+    chunks = []
+    current = ""
+    for clause in _CLAUSE_BOUNDARY_RE.split(sentence):
+        candidate = f"{current} {clause}".strip() if current else clause
+        if current and len(candidate.split()) > max_words:
+            chunks.append(current.strip())
+            current = clause
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
 
 def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id):
     """Run CSM on a single completed LLM sentence, streaming each resulting
@@ -506,17 +532,22 @@ def speak_streaming(user_text, session_id="default"):
                 # generating audio, inside _generate_sentence_audio below.
                 complete_sentences, sentence_buffer = extract_complete_sentences(sentence_buffer)
                 for sentence in complete_sentences:
-                    is_speaking = True
-                    if not _generate_sentence_audio(sentence, turn_context, playback_state, this_id):
-                        aborted = True
+                    for chunk in _split_long_sentence(sentence):
+                        is_speaking = True
+                        if not _generate_sentence_audio(chunk, turn_context, playback_state, this_id):
+                            aborted = True
+                            break
+                    if aborted:
                         break
                 if aborted:
                     break
 
             if not aborted and sentence_buffer.strip():
-                is_speaking = True
-                if not _generate_sentence_audio(sentence_buffer.strip(), turn_context, playback_state, this_id):
-                    aborted = True
+                for chunk in _split_long_sentence(sentence_buffer.strip()):
+                    is_speaking = True
+                    if not _generate_sentence_audio(chunk, turn_context, playback_state, this_id):
+                        aborted = True
+                        break
 
         full_response_text = full_response_text.strip()
 
@@ -853,6 +884,12 @@ def preprocess_text_for_tts(text):
     Returns:
     str: Cleaned text with only allowed punctuation
     """
+    # Em/en dashes are used by the LLM as clause separators (often with no
+    # surrounding whitespace, e.g. "mind—whether"). Stripping them outright
+    # below would fuse the words on either side into one garbled non-word,
+    # which both undercounts the word-based duration estimate and confuses
+    # the TTS model, so convert them to a natural pause first.
+    text = re.sub(r'\s*[—–]\s*', ', ', text)
     # Define a regex pattern that matches all punctuation except periods, commas, exclamation points, and question marks
     # This includes: ; : " '  ~ @ # $ % ^ & * ( ) _ - + = [ ] { } \ | / < >
     pattern = r'[^\w\s.,!?\']'
