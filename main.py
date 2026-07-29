@@ -45,8 +45,23 @@ audio_fade_duration = 0.3  # seconds for fade-out
 last_interrupt_time = 0
 interrupt_cooldown = 6.0  # seconds between allowed interrupts
 audio_chunk_buffer = []  # Buffer to store the most recent audio chunks for fade-out
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# All per-session artifacts (per-turn audio clips + the running server log) live
+# under one directory so "clear chat data" can wipe them together in one place.
+SESSION_DATA_DIR = "session_data"
+SESSION_AUDIO_USER_DIR = os.path.join(SESSION_DATA_DIR, "audio", "user")
+SESSION_AUDIO_AI_DIR = os.path.join(SESSION_DATA_DIR, "audio", "ai")
+SESSION_LOG_PATH = os.path.join(SESSION_DATA_DIR, "server.log")
+os.makedirs(SESSION_AUDIO_USER_DIR, exist_ok=True)
+os.makedirs(SESSION_AUDIO_AI_DIR, exist_ok=True)
+
+# Setup logging - mirrors everything to session_data/server.log in addition to
+# the console, so a full run of main.py can be inspected/shared after the fact.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler(SESSION_LOG_PATH)],
+)
 logger = logging.getLogger(__name__)
 model_thread = None
 model_queue = queue.Queue()
@@ -292,7 +307,7 @@ def on_speech_end(audio_data, sample_rate):
         session_id = "default"
         speaker_id = 1
         index = speaker_counters[speaker_id]
-        user_audio_path = f"audio/user/{session_id}_user_{index}.wav"
+        user_audio_path = f"{SESSION_AUDIO_USER_DIR}/{session_id}_user_{index}.wav"
         os.makedirs(os.path.dirname(user_audio_path), exist_ok=True)
 
         audio_tensor = torch.tensor(audio_data).unsqueeze(0)
@@ -409,6 +424,8 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
         f"cap {max_audio_length_ms}ms): {sentence_text!r}"
     )
 
+    tts_request_time = time.time()
+
     model_queue.put((
         sentence_text,
         config.voice_speaker_id,
@@ -420,6 +437,7 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
 
     sentence_chunks = []
     aborted = False
+    tts_first_chunk_logged = False
     while True:
         try:
             result = model_result_queue.get(timeout=0.5)
@@ -437,6 +455,20 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
         if interrupt_flag.is_set():
             aborted = True
             continue  # keep draining until EOS, but stop forwarding chunks
+
+        if not tts_first_chunk_logged:
+            tts_first_chunk_logged = True
+            tts_first_chunk_latency = time.time() - tts_request_time
+            logger.info(
+                f"Generation {gen_id} - TTS time-to-first-chunk: {tts_first_chunk_latency*1000:.0f}ms "
+                f"for sentence {sentence_text!r}"
+            )
+            if playback_state["chunk_counter"] == 0:
+                turn_first_chunk_latency = time.time() - playback_state["turn_start_time"]
+                logger.info(
+                    f"Generation {gen_id} - end-to-end time-to-first-audio-chunk (turn start to first "
+                    f"chunk, includes LLM time): {turn_first_chunk_latency*1000:.0f}ms"
+                )
 
         chunk_array = result.cpu().numpy().astype(np.float32)
         sentence_chunks.append(chunk_array)
@@ -509,7 +541,7 @@ def speak_streaming(user_text, session_id="default"):
     turn_context = list(reference_segments)
     full_response_text = ""
     output_file = ""
-    playback_state = {"all_chunks": [], "chunk_counter": 0, "gen_id": this_id}
+    playback_state = {"all_chunks": [], "chunk_counter": 0, "gen_id": this_id, "turn_start_time": speaking_start_time}
 
     try:
         start_model_thread()
@@ -531,8 +563,17 @@ def speak_streaming(user_text, session_id="default"):
         )
 
         sentence_buffer = ""
+        llm_request_time = time.time()
+        llm_first_token_logged = False
         with llm_lock:
             for delta in llm.generate_response_stream(system_prompt, user_text, context):
+                if not llm_first_token_logged:
+                    llm_first_token_logged = True
+                    llm_first_token_latency = time.time() - llm_request_time
+                    logger.info(
+                        f"Generation {this_id} - LLM time-to-first-token: {llm_first_token_latency*1000:.0f}ms"
+                    )
+
                 if interrupt_flag.is_set():
                     aborted = True
                     break
@@ -594,7 +635,7 @@ def speak_streaming(user_text, session_id="default"):
             db.add(conv)
             db.commit()
             index = speaker_counters[0]
-            output_file = f"audio/ai/{session_id}_response_{index}.wav"
+            output_file = f"{SESSION_AUDIO_AI_DIR}/{session_id}_response_{index}.wav"
             speaker_counters[0] += 1
             conv.audio_path = output_file
             db.commit()
@@ -790,6 +831,75 @@ def save_audio_and_trim(path, session_id, speaker_id, tensor, sample_rate):
             if os.path.exists(old_path):
                 os.remove(old_path)
                 logger.info(f"Removed old audio file from other speaker: {old_path}")
+
+
+def clear_log_file():
+    """Truncate the running server log to empty, without closing/reopening
+    the handle logging is actively writing through."""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.FileHandler) and \
+                os.path.abspath(handler.baseFilename) == os.path.abspath(SESSION_LOG_PATH):
+            handler.acquire()
+            try:
+                handler.stream.seek(0)
+                handler.stream.truncate(0)
+            finally:
+                handler.release()
+
+
+def clear_chat_data():
+    """Wipe every layer that remembers past conversations.
+
+    Deleting rows from the `conversations` table alone (the old behavior)
+    left several other stores completely untouched, so the AI kept
+    "remembering" deleted chats:
+      - RAG's own `embeddings` table + on-disk vector cache (rag_system.py) -
+        queried independently of `conversations`, with no check that the
+        source conversation still exists.
+      - The in-memory `conversation_history` list used to build LLM context.
+      - The dynamic (conversation-derived) part of `reference_segments`, CSM's
+        own voice-continuity context. The protected/reference-clip segments
+        from config are left alone - those are voice setup, not chat history.
+      - Saved per-turn audio clips and the running server log under
+        session_data/.
+    """
+    global conversation_history, reference_segments, saved_audio_paths, speaker_counters
+
+    conn = sqlite3.connect("companion.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM conversations")
+    conn.commit()
+    conn.close()
+
+    if rag is not None:
+        rag.clear_all()
+
+    conversation_history = []
+
+    if config is not None:
+        num_protected_segments = 0
+        if config.reference_audio_path and os.path.exists(config.reference_audio_path):
+            num_protected_segments += 1
+        if config.reference_audio_path2 and os.path.exists(config.reference_audio_path2):
+            num_protected_segments += 1
+        if config.reference_audio_path3 and os.path.exists(config.reference_audio_path3):
+            num_protected_segments += 1
+        reference_segments = reference_segments[:num_protected_segments]
+
+    for directory in (SESSION_AUDIO_USER_DIR, SESSION_AUDIO_AI_DIR):
+        for fname in os.listdir(directory):
+            fpath = os.path.join(directory, fname)
+            try:
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+            except Exception as e:
+                logger.error(f"Error removing audio file {fpath}: {e}")
+
+    saved_audio_paths = {"default": {0: [], 1: []}}
+    speaker_counters = {0: 0, 1: 0}
+
+    clear_log_file()
+    logger.info("Chat data cleared: DB, RAG embeddings/cache, audio clips, log file, and in-memory context.")
 
 # CSM's audio context window is only for voice continuity, not conversation
 # memory (that's handled separately by the RAG system + LLM history). Keep it
@@ -1147,8 +1257,8 @@ async def chat_page(request: Request):
 @app.on_event("startup")
 async def startup_event():
     os.makedirs("static", exist_ok=True)
-    os.makedirs("audio/user", exist_ok=True)
-    os.makedirs("audio/ai", exist_ok=True)
+    os.makedirs(SESSION_AUDIO_USER_DIR, exist_ok=True)
+    os.makedirs(SESSION_AUDIO_AI_DIR, exist_ok=True)
     os.makedirs("embeddings_cache", exist_ok=True)
     os.makedirs("templates", exist_ok=True)
     with open("templates/index.html", "w") as f:
@@ -1188,13 +1298,10 @@ async def update_conversation(conv_id: int, update: ConversationUpdate):
 @app.delete("/api/conversations")
 async def delete_all_conversations():
     try:
-        conn = sqlite3.connect("companion.db")
-        cur = conn.cursor()
-        cur.execute("DELETE FROM conversations")
-        conn.commit()
-        conn.close()
+        clear_chat_data()
         return {"status": "all deleted"}
     except Exception as e:
+        logger.error(f"Error clearing chat data: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.delete("/api/conversations/{conv_id}")
@@ -1205,6 +1312,16 @@ async def delete_conversation(conv_id: int):
         cur.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
         conn.commit()
         conn.close()
+
+        # Also drop this conversation's derived RAG state (embeddings table
+        # row + vector cache) - deleting the DB row alone leaves RAG able to
+        # keep recalling it, since query() never checks the source row still
+        # exists. There's no reliable id-to-file mapping for the per-turn
+        # audio clips or in-memory context, so those are only fully reset by
+        # the "clear all" action above.
+        if rag is not None:
+            rag.delete_conversation(conv_id)
+
         return JSONResponse(content={"status": "deleted", "id": conv_id})
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)

@@ -324,6 +324,67 @@ class RAGSystem:
         """Refresh embeddings from the database."""
         self._load_conversations()
 
+    def _remove_embedding_from_cache_file(self, chunk_id: str):
+        """Remove a single chunk's vector from its on-disk cache shard."""
+        cache_file = self.cache_dir / f"{chunk_id[:2]}.json"
+        if not cache_file.exists():
+            return
+        try:
+            with open(cache_file, "r") as f:
+                cache_data = json.load(f)
+            if chunk_id in cache_data:
+                del cache_data[chunk_id]
+                with open(cache_file, "w") as f:
+                    json.dump(cache_data, f)
+        except Exception as e:
+            print(f"Error updating cache file {cache_file}: {e}")
+
+    def delete_conversation(self, conv_id: int):
+        """Remove a single conversation's embedding(s) so it stops being
+        surfaced by query()/get_context(). The `conversations` row itself is
+        managed by the caller (main.py already deletes it directly from the
+        same underlying table) - this only cleans up RAG's own derived state:
+        the `embeddings` table row, the in-memory vector cache, and the
+        on-disk cache shard, none of which are touched by that DB delete.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT chunk_id FROM embeddings WHERE conversation_id = ?", (conv_id,))
+            chunk_ids = [row[0] for row in cursor.fetchall()]
+            cursor.execute("DELETE FROM embeddings WHERE conversation_id = ?", (conv_id,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error deleting conversation {conv_id} from RAG: {e}")
+            return
+
+        for chunk_id in chunk_ids:
+            self.embedding_cache.pop(chunk_id, None)
+            self._remove_embedding_from_cache_file(chunk_id)
+
+    def clear_all(self):
+        """Wipe every stored conversation embedding - used when the user
+        clears all chat data. Leaves the `conversations` table itself to the
+        caller for the same reason as delete_conversation().
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM embeddings")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error clearing embeddings table: {e}")
+
+        self.embedding_cache.clear()
+
+        for cache_file in self.cache_dir.glob("*.json"):
+            try:
+                cache_file.unlink()
+            except Exception as e:
+                print(f"Error removing cache file {cache_file}: {e}")
+
 # Example usage
 if __name__ == "__main__":
     # Initialize the RAG system
