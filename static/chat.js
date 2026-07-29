@@ -410,49 +410,19 @@ function handleWebSocketMessage(d) {
       break;
       
     case 'response':
+      // Text-only: the full transcript is known once the LLM+TTS text loop
+      // finishes, but audio playback of this same turn is very likely still
+      // catching up (RTF < 1 means generation now finishes well before the
+      // audio has actually finished playing through speakers). This handler
+      // must only display the transcript - it must NOT touch playback state
+      // (queue, currentAudioSource, activeGenId), or it truncates the tail
+      // of the response's audio every time. Actual completion is signalled
+      // separately via the 'audio_status' / 'complete' message below, which
+      // correctly leaves in-flight playback alone.
       addMessageToConversation('ai', d.text);
       showVoiceCircle();
-      
-      console.log("NEW RESPONSE RECEIVED - FORCE RESETTING ALL AUDIO STATE");
-      
-      if (isAudioCurrentlyPlaying) {
-        if (currentAudioSource) {
-          try {
-            if (currentAudioSource.disconnect) currentAudioSource.disconnect();
-            if (currentAudioSource.stop) currentAudioSource.stop(0);
-          } catch (e) {
-            console.warn("Error stopping current audio:", e);
-          }
-          currentAudioSource = null;
-        }
-        isAudioCurrentlyPlaying = false;
-      }
-      
-      interruptRequested = false;
-      interruptInProgress = false;
-      
-      activeGenId = 0;
-      
-      audioPlaybackQueue = [];
-      
-      try {
-        if (audioContext) {
-          if (audioContext.state === 'suspended') {
-            audioContext.resume().catch(e => console.warn("Error resuming audio context:", e));
-          }
-        } else {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-          window.audioContext = audioContext;
-        }
-      } catch (e) {
-        console.warn("Error with audio context:", e);
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        window.audioContext = audioContext;
-      }
-      
-      console.log("Audio state fully reset and ready for new audio");
       break;
-      
+
     case 'audio_chunk':
       console.log("Audio chunk received, flags:", 
                  "interruptRequested:", interruptRequested, 
