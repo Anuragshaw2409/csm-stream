@@ -623,8 +623,8 @@ def load_csm_1b_local(model_path: str, device: str = "cuda", audio_num_codebooks
     # slower for the overflow case, but memory growth stays bounded.
     torch._dynamo.config.cache_size_limit = 8
 
-    model.backbone = torch.compile(model.backbone, fullgraph=True, backend='inductor', dynamic=True)
-    model.decoder = torch.compile(model.decoder, fullgraph=True, backend='inductor', dynamic=True)
+    model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
+    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
 
     model.to(device=device, dtype=dtype)
 
@@ -813,15 +813,15 @@ def load_csm_1b(device: str = "cuda") -> Generator:
     # slower for the overflow case, but memory growth stays bounded.
     torch._dynamo.config.cache_size_limit = 8
 
-    model.backbone = torch.compile(model.backbone, fullgraph=True, backend='inductor', dynamic=True)
-    model.decoder = torch.compile(model.decoder, fullgraph=True, backend='inductor', dynamic=True)
+    model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
+    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
 
     model.to(device=device, dtype=dtype)
-    
+
     print("Model compilation complete. Creating generator...")
-    
+
     generator = Generator(model)
-    
+
     generator._stream_buffer_size = 20
     
     
