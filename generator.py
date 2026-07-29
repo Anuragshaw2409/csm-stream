@@ -629,17 +629,12 @@ def load_csm_1b_local(model_path: str, device: str = "cuda", audio_num_codebooks
     torch._dynamo.config.cache_size_limit = 8
 
     model.backbone = torch.compile(model.backbone, fullgraph=True, backend='inductor', dynamic=True)
-    # Unlike the backbone, the decoder's input shape never depends on prompt
-    # or conversation length - within generate_frame() it's called once per
-    # RVQ codebook (up to 31x per audio frame) always at shape (1, 2, *) for
-    # the first codebook and (1, 1, *) for every codebook after, for the
-    # entire lifetime of the process. That bounded shape count (2, not
-    # per-conversation-length) makes it safe to CUDA-graph via
-    # mode='reduce-overhead' without the graph-pool memory growth that ruled
-    # it out for the backbone - and since this loop runs far more often than
-    # the backbone per frame, it's the higher-value target for eliminating
-    # per-call kernel-launch/Python overhead.
-    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor')
+    # TEMPORARILY reverted from mode='reduce-overhead' (CUDA graphs) back to
+    # plain compile while isolating a premature natural-EOS bug (generation
+    # stopping after a handful of frames on otherwise-normal sentences). This
+    # is the one variable that changed since that bug was last confirmed to
+    # still occur, so ruling it in/out first before re-enabling.
+    model.decoder = torch.compile(model.decoder, fullgraph=True, backend='inductor', dynamic=True)
 
     model.to(device=device, dtype=dtype)
 
@@ -830,11 +825,9 @@ def load_csm_1b(device: str = "cuda") -> Generator:
     torch._dynamo.config.cache_size_limit = 8
 
     model.backbone = torch.compile(model.backbone, fullgraph=True, backend='inductor', dynamic=True)
-    # See load_csm_1b_local for why the decoder (unlike the backbone) is safe
-    # to CUDA-graph via reduce-overhead: its call shape is bounded to 2
-    # regardless of conversation length, and it's the far hotter per-frame
-    # loop (up to 31 sequential decoder calls per audio frame).
-    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor')
+    # See load_csm_1b_local for why this is temporarily reverted from
+    # mode='reduce-overhead' back to plain compile.
+    model.decoder = torch.compile(model.decoder, fullgraph=True, backend='inductor', dynamic=True)
 
     model.to(device=device, dtype=dtype)
 
