@@ -8,24 +8,25 @@ Our fork adds **streaming audio generation**, **real-time playback**, and **perf
 
 ## Requirements
 
-* A CUDA-compatible GPU
-* The code has been tested on CUDA 12.4 and 12.6, but it may also work on other versions
-* Similarly, Python 3.10 is recommended, but newer versions may be fine
-* For some audio operations, `ffmpeg` may be required
-* For real-time audio playback: `pip install sounddevice`
-* Access to the following Hugging Face models:
-  * [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
-  * [CSM-1B](https://huggingface.co/sesame/csm-1b)
+- A CUDA-compatible GPU
+- The code has been tested on CUDA 12.4 and 12.6, but it may also work on other versions
+- Similarly, Python 3.10 is recommended, but newer versions may be fine
+- For some audio operations, `ffmpeg` may be required
+- For real-time audio playback: `pip install sounddevice`
+- Access to the following Hugging Face models:
+  - [Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B)
+  - [CSM-1B](https://huggingface.co/sesame/csm-1b)
 
 ### Setup
 
 ```bash
 sudo apt-get update && sudo apt-get install -y libportaudio2 portaudio19-dev
-git clone git@github.com:davidbrowne17/csm-streaming.git
-cd csm-streaming
-python3.10 -m venv .venv
+git clone https://github.com/Anuragshaw2409/csm-stream.git csm
+cd csm
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+hf auth login
 
 # Optional speedup
 pip install flash-attn
@@ -61,12 +62,15 @@ generate_streaming_audio(
     play_audio=True  # Enable real-time playback
 )
 ```
+
 ## Finetuning
+
 To finetune CSM all you need are some wav audio files with the speaker voice you want to train, just the raw wavs. Place them in a folder called audio_data and run lora.py.
 You can configure the exact training params such as batch size, number of epochs and learning rate by modifying the values at the top of lora.py.
 You will need a CUDA gpu with at least 12gb of vram depending on your dataset size and training params. You can monitor the training metrics via the dynamic png created in /finetuned_model/ folder. This contains various graphs to help you track the training progress. If you want to try a checkpoint you can use the loadandmergecheckpoint.py (make sure to set the same R and Alpha values as you used in the training)
 
 ## Realtime chat demo
+
 To use the realtime demo run the setup.py to download the required models, and then run main.py. This will open up a setup page at http://localhost:8000 in which you can set the paths for your chosen LLM and setup the CSM paths and reference audio as well as select your headset and mic. When loaded you will be able to chat in realtime with the AI just like the CSM demo. Our demo includes a dynamic RAG system so the AI can remember previous conversations. The demo by default uses whisper-large-v3-turbo for STT and includes Automatic Voice Detection using Silero VAD.
 
 ## Usage
@@ -130,7 +134,7 @@ for audio_chunk in generator.generate_stream(
 ):
     # Do something with each chunk as it's generated
     print(f"Received chunk of size: {audio_chunk.shape}")
-    
+
     # You could process or play each chunk here
     # For example, write to a file incrementally
     # Or send over a network connection
@@ -195,6 +199,7 @@ audio = generator.generate(
 
 torchaudio.save("audio.wav", audio.unsqueeze(0).cpu(), generator.sample_rate)
 ```
+
 ## Performance Optimizations
 
 Our optimized version includes several performance enhancements:
@@ -236,13 +241,17 @@ By using this model, you agree to comply with all applicable laws and ethical gu
 ---
 
 ## Original Authors
+
 Johan Schalkwyk, Ankit Kumar, Dan Lyth, Sefik Emre Eskimez, Zack Hodari, Cinjon Resnick, Ramon Sanabria, Raven Jiang, and the Sesame team.
 
 ## Streaming, Realtime Demo and Finetuning Implementation
+
 David Browne
 
 ## Support me
+
 Support this project on Ko-fi: https://ko-fi.com/davidbrowne17
 
 ## Transformers streaming
+
 If you want to use streaming with the Transformers implementation you can find it here: https://github.com/davidbrowne17/csm-streaming-tf
