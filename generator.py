@@ -615,16 +615,27 @@ def load_csm_1b_local(model_path: str, device: str = "cuda", audio_num_codebooks
 
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
-    # Cap how many distinct shapes get compiled/captured as CUDA graphs. Each
-    # new shape permanently reserves its own graph memory pool, so an
-    # unbounded number of distinct sentence lengths over a long conversation
-    # will eventually exhaust the GPU. Past this limit, dynamo falls back to
-    # plain eager execution for new shapes instead of capturing more graphs -
-    # slower for the overflow case, but memory growth stays bounded.
+    # Cap how many distinct shapes the backbone compiles/captures as CUDA
+    # graphs. Each new prompt/context length permanently reserves its own
+    # graph memory pool, so an unbounded number of distinct sentence lengths
+    # over a long conversation will eventually exhaust the GPU. Past this
+    # limit, dynamo falls back to plain eager execution for new shapes
+    # instead of capturing more graphs - slower for the overflow case, but
+    # memory growth stays bounded.
     torch._dynamo.config.cache_size_limit = 8
 
-    model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
-    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
+    model.backbone = torch.compile(model.backbone, fullgraph=True, backend='inductor', dynamic=True)
+    # Unlike the backbone, the decoder's input shape never depends on prompt
+    # or conversation length - within generate_frame() it's called once per
+    # RVQ codebook (up to 31x per audio frame) always at shape (1, 2, *) for
+    # the first codebook and (1, 1, *) for every codebook after, for the
+    # entire lifetime of the process. That bounded shape count (2, not
+    # per-conversation-length) makes it safe to CUDA-graph via
+    # mode='reduce-overhead' without the graph-pool memory growth that ruled
+    # it out for the backbone - and since this loop runs far more often than
+    # the backbone per frame, it's the higher-value target for eliminating
+    # per-call kernel-launch/Python overhead.
+    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor')
 
     model.to(device=device, dtype=dtype)
 
@@ -805,16 +816,21 @@ def load_csm_1b(device: str = "cuda") -> Generator:
     model = Model.from_pretrained("sesame/csm-1b")
     
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    # Cap how many distinct shapes get compiled/captured as CUDA graphs. Each
-    # new shape permanently reserves its own graph memory pool, so an
-    # unbounded number of distinct sentence lengths over a long conversation
-    # will eventually exhaust the GPU. Past this limit, dynamo falls back to
-    # plain eager execution for new shapes instead of capturing more graphs -
-    # slower for the overflow case, but memory growth stays bounded.
+    # Cap how many distinct shapes the backbone compiles/captures as CUDA
+    # graphs. Each new prompt/context length permanently reserves its own
+    # graph memory pool, so an unbounded number of distinct sentence lengths
+    # over a long conversation will eventually exhaust the GPU. Past this
+    # limit, dynamo falls back to plain eager execution for new shapes
+    # instead of capturing more graphs - slower for the overflow case, but
+    # memory growth stays bounded.
     torch._dynamo.config.cache_size_limit = 8
 
-    model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
-    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor', dynamic=True)
+    model.backbone = torch.compile(model.backbone, fullgraph=True, backend='inductor', dynamic=True)
+    # See load_csm_1b_local for why the decoder (unlike the backbone) is safe
+    # to CUDA-graph via reduce-overhead: its call shape is bounded to 2
+    # regardless of conversation length, and it's the far hotter per-frame
+    # loop (up to 31 sequential decoder calls per audio frame).
+    model.decoder = torch.compile(model.decoder, mode='reduce-overhead', fullgraph=True, backend='inductor')
 
     model.to(device=device, dtype=dtype)
 
