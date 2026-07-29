@@ -404,6 +404,11 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
     estimated_seconds = len(words) / (85 / 60)  # ~85 wpm, slower than typical speech to leave pacing headroom
     max_audio_length_ms = max(int(estimated_seconds * 1000 * 1.6), 1500)  # 60% buffer + floor for pauses/short sentences
 
+    logger.info(
+        f"Generation {gen_id} - TTS call for sentence ({len(words)} words, "
+        f"cap {max_audio_length_ms}ms): {sentence_text!r}"
+    )
+
     model_queue.put((
         sentence_text,
         config.voice_speaker_id,
@@ -458,7 +463,14 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
         )
 
     if aborted:
+        logger.info(f"Generation {gen_id} - sentence aborted mid-generation: {sentence_text!r}")
         return False
+
+    sentence_seconds = sum(len(c) for c in sentence_chunks) / generator.sample_rate
+    logger.info(
+        f"Generation {gen_id} - sentence complete: {sentence_seconds:.2f}s generated "
+        f"vs {estimated_seconds:.2f}s estimated (cap was {max_audio_length_ms}ms): {sentence_text!r}"
+    )
 
     playback_state["all_chunks"].extend(sentence_chunks)
 

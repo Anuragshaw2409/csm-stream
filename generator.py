@@ -283,6 +283,10 @@ class Generator:
                         # generation here, not just this batch, otherwise the
                         # frame is silently discarded and generation keeps
                         # going past the point the model considered "done".
+                        logger.info(
+                            f"generate_stream: natural EOS (all-zero frame) at frame {i}/{max_generation_len} "
+                            f"({i * 0.08:.2f}s generated)"
+                        )
                         natural_eos = True
                         stop_batch = True
                         break
