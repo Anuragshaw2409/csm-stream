@@ -184,9 +184,13 @@ class Generator:
 
         tokens, tokens_mask = [], []
 
-        initial_batch_size = 20
-        normal_batch_size = 20  
-        initial_buffer_size = 20
+        # Small initial buffer so the first chunk of every sentence lands fast
+        # (this directly bounds the audible gap between sentences, since each
+        # sentence pays this priming cost before its first chunk can be sent).
+        # Larger normal buffer after that for decode throughput.
+        initial_batch_size = 6
+        normal_batch_size = 20
+        initial_buffer_size = 6
         normal_buffer_size = 20
         
         batch_size = initial_batch_size
