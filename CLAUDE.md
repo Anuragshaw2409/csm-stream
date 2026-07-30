@@ -14,17 +14,15 @@ Voice companion server: LLM (streamed) -> sentence splitter -> CSM (Sesame) TTS 
 
 ## Turn flow (`main.py:speak_streaming`, ~line 516)
 
-1. LLM streams text deltas (`llm.generate_response_stream`, held under `llm_lock`).
-2. `extract_complete_sentences` peels off finished sentences from the running buffer as deltas arrive.
-3. Each sentence (optionally split further by `_split_long_sentence` for long clauses) is handed to `_generate_sentence_audio` (`main.py:397`), which:
+1. A producer thread (`_llm_producer`, `main.py:572`) streams LLM text deltas (`llm.generate_response_stream`, a real OpenRouter HTTPS call, held under `llm_lock`) and pushes each complete sentence (`extract_complete_sentences`, optionally split further by `_split_long_sentence`) onto `sentence_queue`, finishing with a `None` sentinel. This runs concurrently with TTS generation so LLM network latency/jitter for sentence N+1's text is absorbed while sentence N's audio is still being generated, instead of blocking the LLM read behind a full TTS drain.
+2. The main thread consumes `sentence_queue` and, for each sentence, calls `_generate_sentence_audio` (`main.py:397`), which:
    - computes a `max_audio_length_ms` cap from word count (`estimated_seconds * 1.6`, floor 1500ms),
    - pushes `(text, speaker, context, cap, temperature, topk)` onto `model_queue`,
    - **blocks** in a loop draining `model_result_queue` until the `None` EOS marker for *that sentence* arrives, forwarding each chunk to the client over the websocket as it's produced,
    - appends the finished sentence's audio to `turn_context` (so the next sentence's generation stays prosody-consistent with it).
-4. The outer `for delta in ...` loop only resumes pulling more LLM tokens once step 3 fully returns.
-5. `model_worker` (`main.py:724`) is the single consumer of `model_queue`; it owns the one loaded `Generator`/model instance and processes requests strictly one at a time to completion (`for chunk in generator.generate_stream(...): model_result_queue.put(chunk)`).
+3. `model_worker` (`main.py:745`) is the single consumer of `model_queue`; it owns the one loaded `Generator`/model instance and processes requests strictly one at a time to completion (`for chunk in generator.generate_stream(...): model_result_queue.put(chunk)`).
 
-**Net effect: sentences are generated strictly sequentially — sentence N+1 is not even requested until sentence N's entire generation (all frames, not just first chunk) has drained.** There is no cross-sentence prefetch/pipelining, and only one GPU generation can be in flight at a time regardless (single model instance, single worker thread).
+**GPU generation is still strictly sequential across sentences** — sentence N+1's audio is not requested until sentence N's entire generation (all frames, not just first chunk) has drained, and only one GPU generation can be in flight at a time regardless (single model instance, single worker thread; confirmed no idle GPU gap exists between sentences — the worker picks up the next request within ~1ms of the previous one's EOS). The producer/consumer split above only removes the *non-GPU* overhead that used to sit on the same critical path (LLM read-ahead latency); it does not and cannot make two sentences generate concurrently on the GPU.
 
 ## Why inter-sentence gaps are audible
 

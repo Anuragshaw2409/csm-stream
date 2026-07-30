@@ -539,7 +539,6 @@ def speak_streaming(user_text, session_id="default"):
 
     aborted = False
     turn_context = list(reference_segments)
-    full_response_text = ""
     output_file = ""
     playback_state = {"all_chunks": [], "chunk_counter": 0, "gen_id": this_id, "turn_start_time": speaking_start_time}
 
@@ -562,47 +561,68 @@ def speak_streaming(user_text, session_id="default"):
             loop
         )
 
-        sentence_buffer = ""
-        llm_request_time = time.time()
-        llm_first_token_logged = False
-        with llm_lock:
-            for delta in llm.generate_response_stream(system_prompt, user_text, context):
-                if not llm_first_token_logged:
-                    llm_first_token_logged = True
-                    llm_first_token_latency = time.time() - llm_request_time
-                    logger.info(
-                        f"Generation {this_id} - LLM time-to-first-token: {llm_first_token_latency*1000:.0f}ms"
-                    )
+        # LLM reading and TTS generation run on separate threads, connected by
+        # sentence_queue. This lets the LLM keep streaming (and network jitter
+        # get absorbed) while CSM is still busy generating audio for a prior
+        # sentence, instead of the LLM read blocking on TTS's full drain of
+        # each sentence before the next one is even requested from the model.
+        sentence_queue: "queue.Queue" = queue.Queue()
+        producer_state = {"full_text": "", "error": None}
 
-                if interrupt_flag.is_set():
-                    aborted = True
-                    break
+        def _llm_producer():
+            sentence_buffer = ""
+            llm_request_time = time.time()
+            llm_first_token_logged = False
+            try:
+                with llm_lock:
+                    for delta in llm.generate_response_stream(system_prompt, user_text, context):
+                        if not llm_first_token_logged:
+                            llm_first_token_logged = True
+                            llm_first_token_latency = time.time() - llm_request_time
+                            logger.info(
+                                f"Generation {this_id} - LLM time-to-first-token: {llm_first_token_latency*1000:.0f}ms"
+                            )
 
-                sentence_buffer += delta
-                full_response_text += delta
-
-                # is_speaking flips True the moment the first sentence starts
-                # generating audio, inside _generate_sentence_audio below.
-                complete_sentences, sentence_buffer = extract_complete_sentences(sentence_buffer)
-                for sentence in complete_sentences:
-                    for chunk in _split_long_sentence(sentence):
-                        is_speaking = True
-                        if not _generate_sentence_audio(chunk, turn_context, playback_state, this_id):
-                            aborted = True
+                        if interrupt_flag.is_set():
                             break
-                    if aborted:
-                        break
-                if aborted:
-                    break
 
-            if not aborted and sentence_buffer.strip():
-                for chunk in _split_long_sentence(sentence_buffer.strip()):
-                    is_speaking = True
-                    if not _generate_sentence_audio(chunk, turn_context, playback_state, this_id):
-                        aborted = True
-                        break
+                        sentence_buffer += delta
+                        producer_state["full_text"] += delta
 
-        full_response_text = full_response_text.strip()
+                        complete_sentences, sentence_buffer = extract_complete_sentences(sentence_buffer)
+                        for sentence in complete_sentences:
+                            for chunk in _split_long_sentence(sentence):
+                                sentence_queue.put(chunk)
+
+                    if not interrupt_flag.is_set() and sentence_buffer.strip():
+                        for chunk in _split_long_sentence(sentence_buffer.strip()):
+                            sentence_queue.put(chunk)
+            except Exception as e:
+                producer_state["error"] = e
+            finally:
+                sentence_queue.put(None)  # sentinel: no more sentences coming
+
+        producer_thread = threading.Thread(target=_llm_producer, daemon=True)
+        producer_thread.start()
+
+        # is_speaking flips True the moment the first sentence starts
+        # generating audio, inside _generate_sentence_audio below.
+        while True:
+            sentence = sentence_queue.get()
+            if sentence is None:
+                break
+            is_speaking = True
+            if not _generate_sentence_audio(sentence, turn_context, playback_state, this_id):
+                break
+
+        producer_thread.join(timeout=5)
+        if producer_state["error"] is not None:
+            raise producer_state["error"]
+
+        if interrupt_flag.is_set():
+            aborted = True
+
+        full_response_text = producer_state["full_text"].strip()
 
         if aborted:
             logger.info(f"Generation {this_id} - aborted (user started speaking)")
