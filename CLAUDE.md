@@ -17,10 +17,23 @@ Voice companion server: LLM (streamed) -> sentence splitter -> CSM (Sesame) TTS 
 1. A producer thread (`_llm_producer`, `main.py:572`) streams LLM text deltas (`llm.generate_response_stream`, a real OpenRouter HTTPS call, held under `llm_lock`) and pushes each complete sentence (`extract_complete_sentences`, optionally split further by `_split_long_sentence`) onto `sentence_queue`, finishing with a `None` sentinel. This runs concurrently with TTS generation so LLM network latency/jitter for sentence N+1's text is absorbed while sentence N's audio is still being generated, instead of blocking the LLM read behind a full TTS drain.
 2. The main thread consumes `sentence_queue` and, for each sentence, calls `_generate_sentence_audio` (`main.py:397`), which:
    - computes a `max_audio_length_ms` cap from word count (`estimated_seconds * 1.6`, floor 1500ms),
-   - pushes `(text, speaker, context, cap, temperature, topk)` onto `model_queue`,
+   - pushes a request dict (`gen_id`, `text`, `speaker`, `context`, `max_ms`, `temperature`, `topk`, `cancel`) onto `model_queue`,
    - **blocks** in a loop draining `model_result_queue` until the `None` EOS marker for *that sentence* arrives, forwarding each chunk to the client over the websocket as it's produced,
    - appends the finished sentence's audio to `turn_context` (so the next sentence's generation stays prosody-consistent with it).
-3. `model_worker` (`main.py:745`) is the single consumer of `model_queue`; it owns the one loaded `Generator`/model instance and processes requests strictly one at a time to completion (`for chunk in generator.generate_stream(...): model_result_queue.put(chunk)`).
+3. `model_worker` is the single consumer of `model_queue`; it owns the one loaded `Generator`/model instance and processes requests strictly one at a time to completion. Results go onto `model_result_queue` as `(gen_id, payload)` pairs, where payload is a chunk, `None` (EOS), or an `Exception`. The `gen_id` tag is what lets a consumer discard leftovers from a cancelled turn instead of desyncing on them.
+
+## Barge-in / cancellation
+
+Cancellation is **scoped per generation**, not global. Each turn gets a private `threading.Event` from `begin_turn(gen_id)`; `end_turn(gen_id)` retires it. Everything that wants to stop a turn goes through `request_interrupt(reason, gen_id=None)`, which refuses to fire if no turn is active or if `gen_id` names a turn that is no longer running.
+
+This matters because interrupts arrive from three places with very different timing — VAD's `on_speech_start` (immediate), the client's `interrupt` websocket message (a few hundred ms later, tagged with the `gen_id` the user actually heard), and `process_user_input` when a new utterance lands mid-turn. A single global flag meant a late interrupt for turn N cancelled turn N+1 instead, so every barge-in silently killed its own reply.
+
+Invariants worth preserving:
+- `generate_stream`'s `cancel_event` is the *request's* event, carried in the model_queue dict — never a process-wide flag.
+- The consumer in `_generate_sentence_audio` must always reach a terminator, and its wait is deadline-bounded: it holds `audio_gen_lock` for the whole turn, so hanging there wedges every future turn.
+- `end_turn()` runs before `audio_gen_lock.release()`, so there is a window where no turn is "active" but the lock is still held. `speak_streaming` therefore acquires the lock *with a timeout* rather than `blocking=False` — dropping the input there means the user gets no answer at all.
+- The mic path must not block the asyncio loop: `vad_processor.process_audio` runs in `vad_executor` (1 thread, order-preserving) and STT runs on its own thread, because the loop is what services the client's interrupt message.
+- Client side (`static/chat.js`): `clearAudioPlayback()` must never close or replace the `AudioContext`. Mic capture lives on a separate `micContext`; closing the shared context killed `onaudioprocess` and the browser stopped sending audio entirely after the first barge-in.
 
 **GPU generation is still strictly sequential across sentences** — sentence N+1's audio is not requested until sentence N's entire generation (all frames, not just first chunk) has drained, and only one GPU generation can be in flight at a time regardless (single model instance, single worker thread; confirmed no idle GPU gap exists between sentences — the worker picks up the next request within ~1ms of the previous one's EOS). The producer/consumer split above only removes the *non-GPU* overhead that used to sit on the same critical path (LLM read-ahead latency); it does not and cannot make two sentences generate concurrently on the GPU.
 

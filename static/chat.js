@@ -23,8 +23,16 @@ let selectedOutputId = null;
 
 let audioPlaybackQueue = [];
 let audioDataHistory = [];
+// micContext is a SEPARATE AudioContext dedicated to microphone capture. It must
+// never be closed or replaced by playback/interrupt handling - the capture graph
+// (MediaStreamSource -> ScriptProcessor -> onaudioprocess -> ws.send) lives on it,
+// and closing it permanently stops audio from reaching the server.
 let micAnalyser, micContext;
 let activeGenId = 0;
+// Every BufferSource we've started for the current turn. A barge-in has to stop
+// all of them, not just the most recent one, or already-scheduled buffers keep
+// playing over the user.
+let activeAudioSources = [];
 
 function createPermanentVoiceCircle() {
   if (document.getElementById('voice-circle')) return;
@@ -194,18 +202,19 @@ function sendTextMessage(txt) {
   
   // Stop any playing audio
   if (isAudioCurrentlyPlaying) {
-    if (currentAudioSource) {
-      try {
-        if (currentAudioSource.disconnect) currentAudioSource.disconnect();
-        if (currentAudioSource.stop) currentAudioSource.stop(0);
-      } catch (e) {
-        console.warn("Error stopping audio:", e);
-      }
-      currentAudioSource = null;
+    const sources = activeAudioSources.slice();
+    activeAudioSources = [];
+    if (currentAudioSource && !sources.includes(currentAudioSource)) {
+      sources.push(currentAudioSource);
     }
+    for (const s of sources) {
+      try { if (s.stop) s.stop(0); } catch (e) { /* already stopped */ }
+      try { if (s.disconnect) s.disconnect(); } catch (e) { /* not connected */ }
+    }
+    currentAudioSource = null;
     isAudioCurrentlyPlaying = false;
   }
-  
+
   // Clear all flags and queues
   interruptRequested = false;
   interruptInProgress = false;
@@ -270,62 +279,42 @@ function resetAudioState() {
 
 function clearAudioPlayback() {
   console.log("FORCEFULLY CLEARING AUDIO PLAYBACK");
-  
+
   interruptRequested = true;
   interruptInProgress = true;
-  
+
   try {
     // Empty the queue first - do this before stopping current source
     console.log(`Clearing queue with ${audioPlaybackQueue.length} items`);
     audioPlaybackQueue = [];
-    
+
     activeGenId = 0;
-    
-    // Stop any currently playing audio
-    if (currentAudioSource) {
-      console.log("Stopping active audio source");
-      
-      try {
-        if (currentAudioSource.disconnect) {
-          currentAudioSource.disconnect();
-        }
-      } catch (e) {
-        console.warn("Error disconnecting audio source:", e);
-      }
-      
-      try {
-        if (currentAudioSource.stop) {
-          currentAudioSource.stop(0);
-        }
-      } catch (e) {
-        console.warn("Error stopping audio source:", e);
-      }
-      
-      currentAudioSource = null;
+
+    // Stop every source we started this turn, not just the latest one.
+    const sources = activeAudioSources.slice();
+    activeAudioSources = [];
+    if (currentAudioSource && !sources.includes(currentAudioSource)) {
+      sources.push(currentAudioSource);
     }
-    
-    try {
-      if (audioContext) {
-        const oldContext = audioContext;
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        window.audioContext = audioContext;
-        
-        try {
-          oldContext.close();
-        } catch (closeError) {
-          console.warn("Error closing old audio context:", closeError);
-        }
-      } else {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        window.audioContext = audioContext;
-      }
-    } catch (contextError) {
-      console.error("Error recreating audio context:", contextError);
+    for (const s of sources) {
+      try { if (s.stop) s.stop(0); } catch (e) { /* already stopped/ended */ }
+      try { if (s.disconnect) s.disconnect(); } catch (e) { /* not connected */ }
     }
+    currentAudioSource = null;
+
+    // NOTE: the playback AudioContext is deliberately NOT closed/recreated here.
+    // It used to be, and because the microphone capture graph was built on this
+    // same context (createMediaStreamSource + createScriptProcessor), closing it
+    // silently killed onaudioprocess - after the very first barge-in the browser
+    // stopped sending mic audio to the server, so VAD never fired again, no STT
+    // ever ran, and the whole app looked frozen. Stopping the buffer sources
+    // above is already sufficient to cut playback instantly; the context is a
+    // long-lived resource and must outlive individual interrupts. The mic now
+    // lives on its own `micContext` as well, so this is belt-and-braces.
   } catch (err) {
     console.error("Error clearing audio:", err);
   }
-  
+
   // Reset state
   isAudioCurrentlyPlaying = false;
   hideVoiceCircle();
@@ -343,17 +332,22 @@ function clearAudioPlayback() {
 // Handle interruption request from user
 function requestInterrupt() {
   console.log("User requested interruption");
-  
+
+  // Capture which generation the user is actually interrupting BEFORE
+  // clearAudioPlayback() resets activeGenId. The server uses this to make sure
+  // a late-arriving interrupt can't cancel a newer turn instead.
+  const targetGenId = activeGenId || lastSeenGenId || 0;
+
   if (interruptInProgress) {
     console.log("Interrupt already in progress - force clearing again");
     clearAudioPlayback();
     return false;
   }
-  
+
   // Set the flags immediately
   interruptRequested = true;
   interruptInProgress = true;
-  
+
   // Show visual feedback
   showNotification("Interrupting...", "info");
   
@@ -373,10 +367,9 @@ function requestInterrupt() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     console.log("Sending interrupt request to server");
     try {
-      ws.send(JSON.stringify({
-        type: 'interrupt',
-        immediate: true
-      }));
+      const msg = {type: 'interrupt', immediate: true};
+      if (targetGenId) msg.gen_id = targetGenId;
+      ws.send(JSON.stringify(msg));
     } catch (error) {
       console.error("Error sending interrupt request:", error);
     }
@@ -447,6 +440,7 @@ function handleWebSocketMessage(d) {
         activeGenId = d.gen_id || 1;
         console.log("!!! Setting activeGenId to:", activeGenId);
       }
+      if (d.gen_id) lastSeenGenId = d.gen_id;
       
       // Only accept chunks that match our active generation
       if ((d.gen_id === activeGenId) || (activeGenId === 0)) {
@@ -521,27 +515,6 @@ function handleWebSocketMessage(d) {
         }
       }
       break;
-  }
-}
-
-function queueAudioForPlayback(arr, sr, genId = 0) {
-  if (activeGenId !== 0 && genId !== activeGenId) {
-    console.log(`Stale chunk ignored (genId mismatch): ${genId} vs ${activeGenId}`);
-    return;
-  }
-  
-  // Don't queue if interrupting
-  if (interruptRequested || interruptInProgress) {
-    console.log("Interrupt active - skipping audio chunk");
-    return;
-  }
-  
-  console.log("Queueing audio chunk for playback");
-  audioPlaybackQueue.push({arr, sr, genId});
-  
-  if (!isAudioCurrentlyPlaying) {
-    console.log("▶Starting audio playback");
-    processAudioPlaybackQueue();
   }
 }
 
@@ -678,8 +651,9 @@ async function playAudioChunk(audioArr, sampleRate) {
     
     // Store reference to current source for potential interruption
     currentAudioSource = src;
-    
-    const an = audioContext.createAnalyser(); 
+    activeAudioSources.push(src);
+
+    const an = audioContext.createAnalyser();
     an.fftSize = 256;
     src.connect(an); 
     an.connect(audioContext.destination); 
@@ -716,12 +690,11 @@ async function playAudioChunk(audioArr, sampleRate) {
     
     return new Promise(resolve => {
       src.onended = () => {
-        // Only resolve if this is still the current source and no interrupt
-        if (src === currentAudioSource && !interruptRequested && !interruptInProgress) {
-          resolve();
-        } else {
-          resolve(); // Still resolve to maintain chain
-        }
+        const idx = activeAudioSources.indexOf(src);
+        if (idx !== -1) activeAudioSources.splice(idx, 1);
+        // Resolve either way to keep the playback chain moving; the queue
+        // processor re-checks the interrupt flags before pulling the next chunk.
+        resolve();
       };
     });
   } catch (error) {
@@ -738,10 +711,16 @@ async function startRecording() {
     };
     micStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-    if (!audioContext) audioContext = new (AudioContext||webkitAudioContext)();
-    const src = audioContext.createMediaStreamSource(micStream);
-    const proc = audioContext.createScriptProcessor(4096,1,1);
-    src.connect(proc); proc.connect(audioContext.destination);
+    // Capture runs on its own context so that clearing playback on a barge-in
+    // can never tear down the microphone pipeline.
+    if (!micContext || micContext.state === 'closed') {
+      micContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (micContext.state === 'suspended') await micContext.resume();
+
+    const src = micContext.createMediaStreamSource(micStream);
+    const proc = micContext.createScriptProcessor(4096,1,1);
+    src.connect(proc); proc.connect(micContext.destination);
 
     proc.onaudioprocess = e => {
       const samples = Array.from(e.inputBuffer.getChannelData(0));
@@ -750,7 +729,7 @@ async function startRecording() {
           ws.send(JSON.stringify({
             type:'audio',
             audio:samples,
-            sample_rate:audioContext.sampleRate,
+            sample_rate:micContext.sampleRate,
             session_id:SESSION_ID
           }));
         } catch (error) {

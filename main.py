@@ -9,6 +9,7 @@ import time
 import threading
 import json
 import queue
+from concurrent.futures import ThreadPoolExecutor
 from fastapi.websockets import WebSocketState
 import torch
 import torchaudio
@@ -40,10 +41,17 @@ speaker_counters = {
 }
 current_generation_id = 1
 pending_user_inputs = []
-user_input_lock = threading.Lock()
+# Re-entrant: process_pending_inputs() -> process_user_input() can re-enter this
+# lock on the same thread. With a plain Lock that self-deadlocks, and because the
+# websocket handler also acquires this lock *synchronously inside the asyncio
+# event loop*, a deadlocked worker froze the entire server permanently.
+user_input_lock = threading.RLock()
 audio_fade_duration = 0.3  # seconds for fade-out
 last_interrupt_time = 0
-interrupt_cooldown = 6.0  # seconds between allowed interrupts
+# Debounce window for repeated interrupts targeting the SAME generation only. A
+# barge-in against a new turn is never suppressed - the old 6s global cooldown
+# silently swallowed legitimate back-to-back barge-ins.
+interrupt_cooldown = 1.0
 audio_chunk_buffer = []  # Buffer to store the most recent audio chunks for fade-out
 
 # All per-session artifacts (per-turn audio clips + the running server log) live
@@ -107,11 +115,99 @@ conversation_history = []
 config = None
 audio_queue = queue.Queue()
 is_speaking = False
-interrupt_flag = threading.Event()
 # Set for the entire duration of an AI turn: from the moment the LLM starts
 # streaming through the end of audio playback. Lets on_speech_start() detect
 # a barge-in even before playback has begun (while CSM is still generating).
 ai_turn_active = threading.Event()
+
+# --- Cancellation, scoped per generation -----------------------------------
+# There used to be a single global `interrupt_flag` shared by every turn. That
+# made interrupts un-addressable: an interrupt raised for turn N (e.g. the
+# client's `interrupt` websocket message, which arrives a few hundred ms after
+# the VAD-side barge-in that already aborted turn N) would land on turn N+1 if
+# N had unwound in the meantime, killing the fresh turn before it produced a
+# single chunk. With every utterance cancelling its own successor, the assistant
+# went permanently silent.
+#
+# Each turn now owns a private Event. Interrupt requests name the generation
+# they mean to cancel, and a request for an already-finished generation is
+# dropped instead of leaking onto the next one.
+turn_state_lock = threading.Lock()
+# Pre-set: with no turn in flight there is nothing to cancel, and any stray
+# request should be a no-op rather than arming the next turn.
+current_turn_cancel = threading.Event()
+current_turn_cancel.set()
+current_turn_id = 0
+
+
+def _drain_queue(q):
+    """Remove everything currently in a queue.Queue, returning the count."""
+    dropped = 0
+    while True:
+        try:
+            q.get_nowait()
+            dropped += 1
+        except queue.Empty:
+            return dropped
+
+
+def begin_turn(gen_id):
+    """Install a fresh cancel event for a new generation and return it."""
+    global current_turn_cancel, current_turn_id
+    with turn_state_lock:
+        current_turn_cancel = threading.Event()
+        current_turn_id = gen_id
+        ai_turn_active.set()
+        return current_turn_cancel
+
+
+def end_turn(gen_id):
+    """Retire a generation. Interrupts naming it afterwards become no-ops."""
+    global current_turn_cancel, current_turn_id
+    with turn_state_lock:
+        if current_turn_id != gen_id:
+            return  # a newer turn already took over; leave its state alone
+        ai_turn_active.clear()
+        current_turn_id = 0
+        current_turn_cancel = threading.Event()
+        current_turn_cancel.set()
+
+
+def request_interrupt(reason, gen_id=None):
+    """Cancel the in-flight generation.
+
+    gen_id, when given, scopes the request: it is ignored unless it names the
+    generation that is actually running. Returns True if a live turn was
+    cancelled by this call, False if there was nothing (current) to cancel.
+    """
+    with turn_state_lock:
+        if not ai_turn_active.is_set() or current_turn_id == 0:
+            logger.info(f"Interrupt ignored ({reason}): no active AI turn")
+            return False
+        if gen_id is not None and gen_id != current_turn_id:
+            logger.info(
+                f"Interrupt ignored ({reason}): targets generation {gen_id}, "
+                f"but generation {current_turn_id} is running"
+            )
+            return False
+        if current_turn_cancel.is_set():
+            logger.info(f"Interrupt ({reason}): generation {current_turn_id} already cancelling")
+            return True
+        logger.info(f"Interrupt ({reason}): cancelling generation {current_turn_id}")
+        current_turn_cancel.set()
+        return True
+
+
+def interrupt_pending():
+    """True if the currently running turn has been cancelled."""
+    with turn_state_lock:
+        return ai_turn_active.is_set() and current_turn_cancel.is_set()
+
+
+WARMUP_GEN_ID = -1  # reserved id for the startup warm-up TTS request
+# Single worker so mic chunks are fed to the VAD state machine in arrival order.
+vad_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad")
+
 generator = None
 llm = None
 # Set from --openrouter-api-key / --openrouter-model at startup (see __main__);
@@ -256,36 +352,40 @@ def initialize_models(config_data: CompanionConfig):
     t0 = time.time()
 
     # send a dummy request; max 0.5 s of audio, result discarded
-    model_queue.put((
-        "warm‑up.",                          # text
-        config_data.voice_speaker_id,        # speaker
-        [],                                  # no context
-        500,                                 # max_ms
-        0.7,                                 # temperature
-        40,                                  # top‑k
-    ))
+    model_queue.put({
+        "gen_id": WARMUP_GEN_ID,
+        "text": "warm‑up.",
+        "speaker": config_data.voice_speaker_id,
+        "context": [],
+        "max_ms": 500,
+        "temperature": 0.7,
+        "topk": 40,
+        "cancel": threading.Event(),         # never set: warm-up isn't cancellable
+    })
 
-    # block until worker signals EOS (None marker)
+    # block until worker signals EOS (None marker) for the warm-up request
     while True:
-        r = model_result_queue.get()
-        if r is None:
+        gen_id, payload = model_result_queue.get()
+        if gen_id != WARMUP_GEN_ID:
+            continue
+        if isinstance(payload, Exception):
+            logger.error(f"Warm-up generation failed: {payload}")
+            break
+        if payload is None:
             break
 
     logger.info(f"Voice model ready in {time.time() - t0:.1f}s")
 
 
 def on_speech_start():
-    global interrupt_flag
-
     should_interrupt = False
     if ai_turn_active.is_set():
         time_since_turn_start = time.time() - speaking_start_time if speaking_start_time > 0 else 999
         # Guard against the mic picking up the AI's own voice right as a turn
         # starts and immediately self-interrupting.
-        if time_since_turn_start > MIN_BARGE_LATENCY and not interrupt_flag.is_set():
+        if time_since_turn_start > MIN_BARGE_LATENCY:
             logger.info("User started speaking during an active AI turn - aborting generation/playback")
-            interrupt_flag.set()
-            should_interrupt = True
+            should_interrupt = request_interrupt("vad barge-in")
 
     asyncio.run_coroutine_threadsafe(
         message_queue.put(
@@ -298,11 +398,20 @@ def on_speech_start():
         loop,
     )
 
-def on_speech_end(audio_data, sample_rate):
+def _handle_completed_utterance(audio_data, sample_rate):
+    """STT + persistence + dispatch for one finished user utterance.
+
+    Runs on its own thread: Whisper inference takes long enough that doing it on
+    the VAD thread would stall microphone intake, and doing it on the asyncio
+    event loop (which is where it used to end up, since process_audio() was
+    called straight from the websocket handler) froze message delivery and
+    delayed the client's `interrupt` message until after transcription.
+    """
     try:
         logger.info("Transcription starting")
+        stt_start = time.time()
         user_text = transcribe_audio(audio_data, sample_rate)
-        logger.info(f"Transcription completed: '{user_text}'")
+        logger.info(f"Transcription completed in {(time.time()-stt_start)*1000:.0f}ms: '{user_text}'")
 
         session_id = "default"
         speaker_id = 1
@@ -323,33 +432,45 @@ def on_speech_end(audio_data, sample_rate):
             message_queue.put({"type": "transcription", "text": user_text}),
             loop
         )
-        
-        threading.Thread(target=lambda: process_user_input(user_text, session_id), daemon=True).start()
+
+        process_user_input(user_text, session_id)
     except Exception as e:
-        logger.error(f"VAD callback failed: {e}")
+        import traceback
+        logger.error(f"VAD callback failed: {e}\n{traceback.format_exc()}")
+
+
+def on_speech_end(audio_data, sample_rate):
+    threading.Thread(
+        target=_handle_completed_utterance,
+        args=(audio_data, sample_rate),
+        daemon=True,
+        name="stt_worker",
+    ).start()
 
 def process_pending_inputs():
     """Process only the latest user input after an interruption"""
-    global pending_user_inputs, is_speaking, interrupt_flag
+    global pending_user_inputs, is_speaking
     time.sleep(0.2)
     is_speaking = False
-    interrupt_flag.clear()
-    
+
     with user_input_lock:
         if not pending_user_inputs:
             logger.info("No pending user inputs to process")
             return
-        
+
         # Only take the most recent input and ignore others
         latest_input = pending_user_inputs[-1]
         logger.info(f"Processing only latest input: '{latest_input[0]}'")
-        
+
         # Clear all pending inputs
         pending_user_inputs = []
-        
-        # Process only the latest input
-        user_text, session_id = latest_input
-        process_user_input(user_text, session_id)
+
+    # Dispatch outside the lock: process_user_input() re-acquires user_input_lock
+    # when a turn is active, and it may block on other work. Holding the lock
+    # across that call is what used to wedge the server (the websocket handler
+    # takes this same lock inline on the event loop).
+    user_text, session_id = latest_input
+    process_user_input(user_text, session_id)
 
 _SENTENCE_SPLIT_RE = re.compile(r'(.*?[.!?])(\s+|$)', re.DOTALL)
 
@@ -394,7 +515,7 @@ def _split_long_sentence(sentence, max_words=22):
     return chunks
 
 
-def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id):
+def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id, cancel):
     """Run CSM on a single completed LLM sentence, streaming each resulting
     audio chunk to the client immediately as it's generated (true streaming
     playback - no waiting for the rest of the response). Also appends the
@@ -404,16 +525,19 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
     playback_state is a dict shared across every sentence in this turn:
         {"all_chunks": [...], "chunk_counter": int, "gen_id": int}
 
-    Cancellation is cooperative: generator.generate_stream() itself checks
-    interrupt_flag (passed as cancel_event) and stops within about one frame,
-    so there's no need to kill/restart the model worker thread here - we just
-    stop forwarding chunks and let the worker's (now-fast) EOS marker arrive.
+    Cancellation is cooperative: generator.generate_stream() itself checks this
+    turn's `cancel` event and stops within about one frame, so there's no need
+    to kill/restart the model worker thread here - we just stop forwarding
+    chunks and let the worker's (now-fast) EOS marker arrive.
 
     Returns False if generation was aborted due to a barge-in, True otherwise.
     """
     sentence_text = preprocess_text_for_tts(sentence_text.lower())
     if not sentence_text:
         return True
+
+    if cancel.is_set():
+        return False
 
     words = sentence_text.split()
     estimated_seconds = len(words) / (85 / 60)  # ~85 wpm, slower than typical speech to leave pacing headroom
@@ -426,24 +550,49 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
 
     tts_request_time = time.time()
 
-    model_queue.put((
-        sentence_text,
-        config.voice_speaker_id,
-        list(turn_context),
-        max_audio_length_ms,
-        0.8,  # temperature
-        50    # topk
-    ))
+    model_queue.put({
+        "gen_id": gen_id,
+        "text": sentence_text,
+        "speaker": config.voice_speaker_id,
+        "context": list(turn_context),
+        "max_ms": max_audio_length_ms,
+        "temperature": 0.8,
+        "topk": 50,
+        "cancel": cancel,
+    })
 
     sentence_chunks = []
     aborted = False
     tts_first_chunk_logged = False
+    # Once cancelled the worker stops within ~a frame, so EOS should land almost
+    # immediately. Bound the wait anyway: an EOS that never arrives (dead worker)
+    # used to spin this loop forever while holding audio_gen_lock, after which
+    # every later turn was rejected with "Generation already in progress" and the
+    # assistant never spoke again.
+    abort_deadline = None
     while True:
         try:
-            result = model_result_queue.get(timeout=0.5)
+            result_gen_id, result = model_result_queue.get(timeout=0.5)
         except queue.Empty:
-            if interrupt_flag.is_set():
+            if cancel.is_set():
                 aborted = True
+                if abort_deadline is None:
+                    abort_deadline = time.time() + 10.0
+            if abort_deadline is not None and time.time() > abort_deadline:
+                logger.error(
+                    f"Generation {gen_id} - no EOS from model worker 10s after cancellation; "
+                    f"abandoning this sentence (worker alive: "
+                    f"{model_thread is not None and model_thread.is_alive()})"
+                )
+                break
+            if not (model_thread is not None and model_thread.is_alive()):
+                logger.error(f"Generation {gen_id} - model worker is not running; aborting sentence")
+                break
+            continue
+
+        if result_gen_id != gen_id:
+            # Leftovers from a generation that was cancelled: drop them rather
+            # than letting a stale chunk or EOS marker desync this loop.
             continue
 
         if result is None:
@@ -452,8 +601,10 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
             logger.error(f"Generation {gen_id} - sentence generation error: {result}")
             break
 
-        if interrupt_flag.is_set():
+        if cancel.is_set():
             aborted = True
+            if abort_deadline is None:
+                abort_deadline = time.time() + 10.0
             continue  # keep draining until EOS, but stop forwarding chunks
 
         if not tts_first_chunk_logged:
@@ -524,17 +675,36 @@ def speak_streaming(user_text, session_id="default"):
     - before the first chunk or mid-playback - everything in flight is
     aborted and the pending input is processed fresh once this turn unwinds.
     """
-    global config, is_speaking, pending_user_inputs, interrupt_flag, current_generation_id, speaking_start_time
+    global config, is_speaking, pending_user_inputs, current_generation_id, speaking_start_time
 
-    if not audio_gen_lock.acquire(blocking=False):
-        logger.warning("Generation already in progress, ignoring new input")
+    # Wait rather than drop. There is a window in the previous turn's teardown
+    # where ai_turn_active is already cleared but audio_gen_lock is still held;
+    # a barge-in reply landing in that window used to be discarded outright
+    # ("Generation already in progress, ignoring new input") and the user simply
+    # got no answer. Teardown after a cancellation is fast, so a short wait is
+    # enough; if it isn't, fall back to queueing instead of dropping.
+    if not audio_gen_lock.acquire(timeout=10):
+        logger.warning("Previous generation still running after 10s - queueing input and interrupting it")
+        with user_input_lock:
+            pending_user_inputs = [(user_text, session_id)]
+        request_interrupt("new input blocked behind a stuck turn")
         return
 
     current_generation_id += 1
     this_id = current_generation_id
 
-    interrupt_flag.clear()
-    ai_turn_active.set()
+    # Any TTS work still queued from a previous (cancelled) turn is dead weight -
+    # drop it before this turn starts so the worker doesn't spend GPU time on
+    # audio nobody will ever hear, and so no stale result can reach this turn.
+    dropped_requests = _drain_queue(model_queue)
+    dropped_results = _drain_queue(model_result_queue)
+    if dropped_requests or dropped_results:
+        logger.info(
+            f"Generation {this_id} - dropped {dropped_requests} stale TTS request(s) and "
+            f"{dropped_results} stale result(s) from the previous turn"
+        )
+
+    cancel = begin_turn(this_id)
     speaking_start_time = time.time()
 
     aborted = False
@@ -583,7 +753,7 @@ def speak_streaming(user_text, session_id="default"):
                                 f"Generation {this_id} - LLM time-to-first-token: {llm_first_token_latency*1000:.0f}ms"
                             )
 
-                        if interrupt_flag.is_set():
+                        if cancel.is_set():
                             break
 
                         sentence_buffer += delta
@@ -594,7 +764,7 @@ def speak_streaming(user_text, session_id="default"):
                             for chunk in _split_long_sentence(sentence):
                                 sentence_queue.put(chunk)
 
-                    if not interrupt_flag.is_set() and sentence_buffer.strip():
+                    if not cancel.is_set() and sentence_buffer.strip():
                         for chunk in _split_long_sentence(sentence_buffer.strip()):
                             sentence_queue.put(chunk)
             except Exception as e:
@@ -611,15 +781,31 @@ def speak_streaming(user_text, session_id="default"):
             sentence = sentence_queue.get()
             if sentence is None:
                 break
+            if cancel.is_set():
+                aborted = True
+                break
             is_speaking = True
-            if not _generate_sentence_audio(sentence, turn_context, playback_state, this_id):
+            if not _generate_sentence_audio(sentence, turn_context, playback_state, this_id, cancel):
+                aborted = True
                 break
 
+        # Whatever the producer had already queued behind us is now unwanted.
+        dropped_sentences = _drain_queue(sentence_queue)
+        if dropped_sentences:
+            logger.info(
+                f"Generation {this_id} - discarded {dropped_sentences} queued sentence(s) after cancellation"
+            )
+
         producer_thread.join(timeout=5)
-        if producer_state["error"] is not None:
+        if producer_thread.is_alive():
+            # The LLM stream can sit in a blocking socket read; it holds llm_lock
+            # until it returns, so the next turn's producer will wait on it. Just
+            # note it - don't block this turn's teardown behind it.
+            logger.warning(f"Generation {this_id} - LLM producer still draining after 5s")
+        elif producer_state["error"] is not None:
             raise producer_state["error"]
 
-        if interrupt_flag.is_set():
+        if cancel.is_set():
             aborted = True
 
         full_response_text = producer_state["full_text"].strip()
@@ -691,7 +877,11 @@ def speak_streaming(user_text, session_id="default"):
         )
     finally:
         is_speaking = False
-        ai_turn_active.clear()
+        # Retires this generation's cancel event: interrupts that were raised
+        # against this turn but arrive late (the client's `interrupt` message
+        # trails the VAD barge-in by a few hundred ms) are now dropped instead
+        # of carrying over and killing the next turn on arrival.
+        end_turn(this_id)
         audio_queue.put(None)
 
         try:
@@ -708,16 +898,15 @@ def speak_streaming(user_text, session_id="default"):
         audio_gen_lock.release()
 
         # Don't hold user_input_lock here: process_pending_inputs() acquires it
-        # itself, and threading.Lock is non-reentrant, so nesting it would
-        # deadlock this thread (and freeze the whole app, since the lock is
-        # also taken synchronously inside the websocket event loop).
+        # itself, and the lock is also taken synchronously inside the websocket
+        # event loop, so anything that wedges it freezes the whole app.
         if pending_user_inputs:
             logger.info(f"Generation {this_id} - processing pending input queued during this turn")
             process_pending_inputs()
 
 
 def process_user_input(user_text, session_id="default"):
-    global pending_user_inputs, interrupt_flag
+    global pending_user_inputs
 
     if not user_text or user_text.strip() == "":
         logger.warning("Empty user input received, ignoring")
@@ -729,9 +918,7 @@ def process_user_input(user_text, session_id="default"):
         with user_input_lock:
             pending_user_inputs = [(user_text, session_id)]
 
-        if not interrupt_flag.is_set():
-            logger.info("Interrupting current generation/speech for new input")
-            interrupt_flag.set()
+        if request_interrupt("new user input arrived mid-turn"):
             asyncio.run_coroutine_threadsafe(
                 message_queue.put({"type": "audio_status", "status": "interrupted"}),
                 loop
@@ -753,34 +940,48 @@ def model_worker(cfg: CompanionConfig):
         logger.info("Voice model ready (compiled with cudagraphs)")
 
     while model_thread_running.is_set():
+        request = None
         try:
             request = model_queue.get(timeout=0.1)
             if request is None:
                 break
 
-            text, speaker_id, context, max_ms, temperature, topk = request
+            gen_id = request["gen_id"]
+            cancel = request["cancel"]
+
+            # The request may have been cancelled while it sat in the queue.
+            # Skip the generation entirely, but still emit EOS so whoever is
+            # waiting on this request unblocks.
+            if cancel.is_set():
+                logger.info(f"Model worker: skipping already-cancelled request for generation {gen_id}")
+                model_result_queue.put((gen_id, None))
+                continue
 
             for chunk in generator.generate_stream(
-                    text=text,
-                    speaker=speaker_id,
-                    context=context,
-                    max_audio_length_ms=max_ms,
-                    cancel_event=interrupt_flag,
-                    temperature=temperature,
-                    topk=topk):
-                model_result_queue.put(chunk)
+                    text=request["text"],
+                    speaker=request["speaker"],
+                    context=request["context"],
+                    max_audio_length_ms=request["max_ms"],
+                    cancel_event=cancel,
+                    temperature=request["temperature"],
+                    topk=request["topk"]):
+                model_result_queue.put((gen_id, chunk))
 
                 if not model_thread_running.is_set():
                     break
 
-            model_result_queue.put(None) # EOS marker
+            model_result_queue.put((gen_id, None))  # EOS marker
 
         except queue.Empty:
             continue
         except Exception as e:
             import traceback
             logger.error(f"Error in model worker: {e}\n{traceback.format_exc()}")
-            model_result_queue.put(Exception(f"Generation error: {e}"))
+            # Always report against the request that failed, and always emit a
+            # terminator - a worker that swallows one leaves the consumer
+            # blocked and the generation lock held forever.
+            failed_gen_id = request["gen_id"] if isinstance(request, dict) else None
+            model_result_queue.put((failed_gen_id, Exception(f"Generation error: {e}")))
 
     logger.info("Model worker thread exiting")
 
@@ -1043,86 +1244,89 @@ def preprocess_text_for_tts(text):
     cleaned_text = re.sub(r'([.,!?])(\S)', r'\1 \2', cleaned_text)
     return cleaned_text.strip()
 
-def handle_interrupt(websocket):
-    global is_speaking, last_interrupt_time, interrupt_flag, model_thread_running, speaking_start_time
-    
-    # Log the current state
-    logger.info(f"Interrupt requested. Current state: is_speaking={is_speaking}")
-    
+def handle_interrupt(websocket, gen_id=None):
+    """Handle an explicit `interrupt` message from the client.
+
+    gen_id, when the client supplies it, names the generation the user meant to
+    interrupt. It matters: this message trails the VAD-side barge-in that has
+    usually already aborted that turn, so without scoping it would land on
+    whatever turn happens to be running by the time it arrives - which after a
+    barge-in is the *reply to the barge-in*, silencing the assistant.
+    """
+    global is_speaking, last_interrupt_time, speaking_start_time
+
+    logger.info(f"Interrupt requested (gen_id={gen_id}). Current state: is_speaking={is_speaking}")
+
     current_time = time.time()
-    time_since_speech_start = current_time - speaking_start_time if speaking_start_time > 0 else 999
     time_since_last_interrupt = current_time - last_interrupt_time
-    
-    # Only apply cooldown for established speech, not for new speech
-    if time_since_last_interrupt < interrupt_cooldown and time_since_speech_start > 3.0:
-        logger.info(f"Ignoring interrupt: too soon after previous interrupt ({time_since_last_interrupt:.1f}s < {interrupt_cooldown}s)")
-        # Let the client know we're not interrupting
+
+    # Debounce only genuine duplicates: repeats aimed at a generation that is
+    # already cancelling. A barge-in against a different/newer turn always gets
+    # through.
+    if time_since_last_interrupt < interrupt_cooldown and interrupt_pending():
+        logger.info(
+            f"Interrupt debounced: current generation is already cancelling "
+            f"({time_since_last_interrupt:.2f}s since last interrupt)"
+        )
         asyncio.run_coroutine_threadsafe(
            websocket.send_json({
                "type": "audio_status",
                "status": "interrupt_acknowledged",
-               "success": False,
-               "reason": "cooldown"
+               "success": True,
+               "reason": "already_interrupting"
            }),
            loop
         )
-        return False
-    
-    # Update the last interrupt time
-    last_interrupt_time = current_time
-    
-    # We should interrupt if we're speaking, generating (even pre-playback), or model generation is in progress
-    if is_speaking or ai_turn_active.is_set() or not model_result_queue.empty():
-        logger.info("Interruption processing: we are speaking or generating")
-        
-        interrupt_flag.set()
-        
-        # Notify clients
-        asyncio.run_coroutine_threadsafe(
-            message_queue.put({"type": "audio_status", "status": "interrupted"}),
-            loop
-        )
-        
-        asyncio.run_coroutine_threadsafe(
-           websocket.send_json({
-               "type": "audio_status",
-               "status": "interrupt_acknowledged"
-           }),
-           loop
-        )
-        
-        # Clear the audio queue to stop additional audio from being processed
-        try:
-            # Drain the existing queue
-            while not audio_queue.empty():
-                try:
-                    audio_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-            # Add end signal
-            audio_queue.put(None)
-            logger.info("Audio queue cleared")
-        except Exception as e:
-            logger.error(f"Error clearing audio queue: {e}")
-
-        # NOTE: deliberately NOT calling vad_processor.reset() here. This
-        # interrupt commonly fires *while* VAD is actively collecting the
-        # user's new utterance (the one that triggered the barge-in) -
-        # resetting it mid-collection would wipe that in-progress audio
-        # buffer and truncate the very speech we're trying to respond to.
-        # VAD's own is_collecting/silent_chunk_count state machine already
-        # handles turn boundaries correctly without an external reset.
-
-        # generator.generate_stream() checks interrupt_flag itself (passed as
-        # cancel_event) and stops within about one frame, so the model worker
-        # doesn't need to be killed/restarted here - it'll pick up the next
-        # queued request on its own once the current one exits.
-
         return True
-    
-    logger.info("No active speech to interrupt")
-    return False
+
+    last_interrupt_time = current_time
+
+    if not request_interrupt("client interrupt message", gen_id=gen_id):
+        logger.info("No active speech to interrupt")
+        return False
+
+    # Notify clients
+    asyncio.run_coroutine_threadsafe(
+        message_queue.put({"type": "audio_status", "status": "interrupted"}),
+        loop
+    )
+
+    asyncio.run_coroutine_threadsafe(
+       websocket.send_json({
+           "type": "audio_status",
+           "status": "interrupt_acknowledged"
+       }),
+       loop
+    )
+
+    # Drop queued TTS work for the cancelled turn. Requests still sitting in
+    # model_queue would otherwise be generated in full on the GPU after the
+    # user has already moved on, delaying their actual reply. In-flight results
+    # are left alone - the consumer discards them by gen_id, and yanking the
+    # EOS marker out from under it would block it.
+    dropped = _drain_queue(model_queue)
+    if dropped:
+        logger.info(f"Dropped {dropped} queued TTS request(s) on interrupt")
+
+    try:
+        _drain_queue(audio_queue)
+        audio_queue.put(None)
+    except Exception as e:
+        logger.error(f"Error clearing audio queue: {e}")
+
+    # NOTE: deliberately NOT calling vad_processor.reset() here. This
+    # interrupt commonly fires *while* VAD is actively collecting the
+    # user's new utterance (the one that triggered the barge-in) -
+    # resetting it mid-collection would wipe that in-progress audio
+    # buffer and truncate the very speech we're trying to respond to.
+    # VAD's own is_collecting/silent_chunk_count state machine already
+    # handles turn boundaries correctly without an external reset.
+
+    # generate_stream() checks the turn's cancel event itself and stops within
+    # about one frame, so the model worker doesn't need to be killed/restarted
+    # here - it picks up the next queued request on its own.
+
+    return True
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -1205,7 +1409,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     sample_rate = 16000
 
                 if config and config.vad_enabled:
-                    vad_processor.process_audio(audio_data)  
+                    # Off the event loop: VAD inference (and, before it was moved
+                    # to its own thread, Whisper) is heavy enough that running it
+                    # inline stalled the loop - which is the same loop that has to
+                    # read the client's `interrupt` message and push audio_status
+                    # frames out. A barge-in could not be serviced while the
+                    # server was busy processing the audio that caused it.
+                    # Single worker thread, so mic chunks stay strictly ordered.
+                    await loop.run_in_executor(vad_executor, vad_processor.process_audio, audio_data)
                 else:
                     text = transcribe_audio(audio_data, sample_rate)
                     await websocket.send_json({"type": "transcription", "text": text})
@@ -1219,36 +1430,45 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         
             elif data["type"] == "interrupt":
-                logger.info("Explicit interrupt request received")
-                
+                # gen_id scopes the request to the generation the user actually
+                # heard. Older clients omit it; then it falls back to "whatever
+                # is running", which is only safe because handle_interrupt no
+                # longer has a way to hit an already-retired turn.
+                target_gen_id = data.get("gen_id")
+                logger.info(f"Explicit interrupt request received (gen_id={target_gen_id})")
+
                 # Always acknowledge receipt of interrupt request
                 await websocket.send_json({
-                    "type": "audio_status", 
+                    "type": "audio_status",
                     "status": "interrupt_acknowledged"
                 })
-                
+
                 # Then try to handle the actual interrupt
-                success = handle_interrupt(websocket)
-                
+                success = handle_interrupt(websocket, gen_id=target_gen_id)
+
                 # If successful, allow a brief delay for clearing everything
                 if success:
                     await asyncio.sleep(0.3)  # Short delay to allow complete clearing
-                    
+
                     # Force process pending inputs after interrupt
+                    pending = None
                     with user_input_lock:
                         if pending_user_inputs:
-                            user_text, session_id = pending_user_inputs.pop(0)
+                            pending = pending_user_inputs.pop(0)
                             pending_user_inputs.clear()  # Clear any backup to avoid multiple responses
-                            
-                            # Process in a new thread to avoid blocking
-                            threading.Thread(
-                                target=lambda: process_user_input(user_text, session_id),
-                                daemon=True
-                            ).start()
-                
+
+                    # Dispatch outside the lock - process_user_input() takes it too.
+                    if pending is not None:
+                        user_text, session_id = pending
+                        threading.Thread(
+                            target=process_user_input,
+                            args=(user_text, session_id),
+                            daemon=True
+                        ).start()
+
                 # Send final status update about the interrupt
                 await websocket.send_json({
-                    "type": "audio_status", 
+                    "type": "audio_status",
                     "status": "interrupted",
                     "success": success
                 })
