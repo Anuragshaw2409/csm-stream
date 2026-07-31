@@ -33,6 +33,18 @@ let activeGenId = 0;
 // all of them, not just the most recent one, or already-scheduled buffers keep
 // playing over the user.
 let activeAudioSources = [];
+// AudioContext-clock timestamp where the next chunk must start so that it
+// splices onto the previous one with no gap. 0 == nothing scheduled.
+let nextPlayTime = 0;
+let playbackAnalyser = null;
+let playbackDrainTimer = null;
+// Runway given to the first chunk of a run before its scheduled start, to
+// absorb main-thread jitter without underrunning the timeline.
+const SCHEDULE_LEAD = 0.06;
+// Rate the CSM generator emits at (generator.sample_rate). Used only to open
+// the context at the right rate before the first chunk arrives; the actual
+// per-chunk rate still comes from the message.
+const SERVER_SAMPLE_RATE = 24000;
 
 function createPermanentVoiceCircle() {
   if (document.getElementById('voice-circle')) return;
@@ -302,6 +314,16 @@ function clearAudioPlayback() {
     }
     currentAudioSource = null;
 
+    // The scheduling cursor must be dropped too: it points somewhere in the
+    // future of a turn that no longer exists, and the next turn's first chunk
+    // would otherwise be scheduled behind that stale tail (silence, then late
+    // audio) instead of starting promptly.
+    nextPlayTime = 0;
+    if (playbackDrainTimer) {
+      clearTimeout(playbackDrainTimer);
+      playbackDrainTimer = null;
+    }
+
     // NOTE: the playback AudioContext is deliberately NOT closed/recreated here.
     // It used to be, and because the microphone capture graph was built on this
     // same context (createMediaStreamSource + createScriptProcessor), closing it
@@ -544,163 +566,180 @@ function queueAudioForPlayback(arr, sr, genId = 0) {
     return;
   }
   
-  console.log("Queueing audio chunk for playback");
   audioPlaybackQueue.push({arr, sr, genId});
-  
-  if (!isAudioCurrentlyPlaying) {
-    console.log("STARTING AUDIO PLAYBACK - FIRST CHUNK");
-    processAudioPlaybackQueue();
-  }
+  // Always drain: the scheduler below is what keeps chunks contiguous, so a
+  // chunk that lands while audio is already playing must be scheduled right
+  // away rather than waiting for the previous one to finish.
+  processAudioPlaybackQueue();
 }
 
 
-// Modified to ensure first audio actually plays
+// Chunks arriving from the server are consecutive slices of ONE continuous
+// waveform (the decoder is stateful across chunks within a sentence), so they
+// have to be spliced back together sample-accurately. This used to start chunk
+// N+1 from `onended` of chunk N, which means the graph output sat at silence
+// for however long it took a main-thread task to run - several ms at best, far
+// more under GC or rAF load. Cutting a waveform to zero mid-cycle and resuming
+// it a few ms later is a step discontinuity, and a step discontinuity is a
+// click. It fired on *every* boundary, which is exactly the crackle symptom.
+//
+// Instead we schedule against the AudioContext clock: each chunk starts exactly
+// where the previous one ended (`nextPlayTime`), so the splice is sample-exact
+// and inaudible. `nextPlayTime` only resyncs to wall-clock when we genuinely
+// underran (the network/GPU didn't keep up), which is a real gap, not one we
+// manufactured.
+function ensurePlaybackContext(sampleRate) {
+  if (!audioContext) {
+    // Create the context at the STREAM's rate. The server sends 24 kHz; a
+    // default context runs at 44.1/48 kHz, which makes the browser resample
+    // each buffer in isolation. Isolated resampling has no neighbouring
+    // samples to interpolate against, so it distorts both edges of every
+    // buffer, and at 44.1 kHz the chunk length doesn't even land on a whole
+    // output sample - both audible as boundary crackle regardless of timing.
+    try {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate});
+    } catch (e) {
+      console.warn("Could not open AudioContext at stream rate, falling back:", e);
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    window.audioContext = audioContext;
+  }
+  if (!playbackAnalyser || playbackAnalyser.context !== audioContext) {
+    // One long-lived analyser for the whole session. Building one per chunk
+    // meant the visualiser restarted its FFT on every boundary too.
+    playbackAnalyser = audioContext.createAnalyser();
+    playbackAnalyser.fftSize = 256;
+    playbackAnalyser.connect(audioContext.destination);
+  }
+  return audioContext;
+}
+
 function processAudioPlaybackQueue() {
   if (!isAudioCurrentlyPlaying && audioPlaybackQueue.length > 0) {
-    console.log("Starting first audio chunk - force clearing interrupt flags");
     interruptRequested = false;
     interruptInProgress = false;
   }
-  
-  // Double-check interrupt flags AFTER clearling them
+
   if (interruptRequested || interruptInProgress) {
     console.log("Interrupt active - not processing audio queue");
-    isAudioCurrentlyPlaying = false;
-    hideVoiceCircle();
     return;
   }
-  
-  // Check if queue is empty
+
   if (!audioPlaybackQueue.length) {
-    console.log("📭 Audio queue empty, stopping playback");
-    isAudioCurrentlyPlaying = false;
-    hideVoiceCircle();
-    currentAudioSource = null;
+    scheduleDrainCheck();
     return;
   }
-  
-  // Enable the interrupt button when audio is playing
+
   const interruptBtn = document.getElementById('interruptBtn');
   if (interruptBtn) {
     interruptBtn.disabled = false;
     interruptBtn.classList.remove('opacity-50');
   }
-  
-  console.log("Processing next audio chunk");
-  isAudioCurrentlyPlaying = true;
-  
-  // Get the genId from the chunk
-  const {arr, sr, genId} = audioPlaybackQueue.shift();
-  
-  // Skip if it's a stale chunk
-  if (activeGenId !== 0 && genId !== activeGenId) {
-    console.log(`Skipping stale chunk playback (gen ${genId} vs active ${activeGenId})`);
-    processAudioPlaybackQueue(); // Continue with next chunk
-    return;
+
+  // Schedule everything we have, back-to-back, in one pass.
+  while (audioPlaybackQueue.length) {
+    const {arr, sr, genId} = audioPlaybackQueue.shift();
+
+    if (activeGenId !== 0 && genId !== activeGenId) {
+      console.log(`Skipping stale chunk playback (gen ${genId} vs active ${activeGenId})`);
+      continue;
+    }
+
+    try {
+      scheduleAudioChunk(arr, sr);
+    } catch (err) {
+      console.error("Error scheduling audio chunk:", err);
+    }
   }
-  
-  playAudioChunk(arr, sr)
-    .then(() => {
-      // Check interrupt status again after playback
-      if (!interruptRequested && !interruptInProgress) {
-        processAudioPlaybackQueue();
-      } else {
-        console.log("interrupt active - stopping queue processing");
-        isAudioCurrentlyPlaying = false;
-        hideVoiceCircle();
-      }
-    })
-    .catch(err => {
-      console.error("Error in audio playback:", err);
-      isAudioCurrentlyPlaying = false;
-      hideVoiceCircle();
-      
-      // Try to continue with next chunk despite errors
-      setTimeout(() => {
-        if (audioPlaybackQueue.length > 0 && !interruptRequested) {
-          processAudioPlaybackQueue();
-        }
-      }, 200);
-    });
+
+  scheduleDrainCheck();
 }
 
-async function playAudioChunk(audioArr, sampleRate) {
-  // Skip playback if interrupt was requested
-  if (interruptRequested || interruptInProgress) {
-    console.log("Interrupt active - not playing audio chunk");
-    return Promise.resolve();
-  }
-  
-  try {
-    // Ensure we have a valid audio context
-    if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      window.audioContext = audioContext;
-    }
-    
-    // Make sure context is resumed
-    if (audioContext.state === 'suspended') {
-      await audioContext.resume();
-    }
-    
-    const buf = audioContext.createBuffer(1, audioArr.length, sampleRate);
-    buf.copyToChannel(new Float32Array(audioArr), 0);
-    
-    const src = audioContext.createBufferSource();
-    src.buffer = buf;
-    
-    // Store reference to current source for potential interruption
-    currentAudioSource = src;
-    activeAudioSources.push(src);
+function scheduleAudioChunk(audioArr, sampleRate) {
+  const ctx = ensurePlaybackContext(sampleRate);
 
-    const an = audioContext.createAnalyser();
-    an.fftSize = 256;
-    src.connect(an); 
-    an.connect(audioContext.destination); 
-    src.start();
-    
-    console.log("🎵 Started playing audio chunk");
-
-    const arr = new Uint8Array(an.frequencyBinCount);
-    const circle = document.getElementById('voice-circle');
-    
-    // Animation function that respects interruption
-    function pump() {
-      // Stop animation if source is no longer current or interrupt requested
-      if (src !== currentAudioSource || interruptRequested || interruptInProgress) {
-        return;
-      }
-      
-      try {
-        an.getByteFrequencyData(arr);
-        const avg = arr.reduce((a,b) => a+b, 0) / arr.length;
-        if (circle) {
-          circle.style.setProperty('--dynamic-scale', (1+avg/255*1.5).toFixed(3));
-        }
-      } catch (e) {
-        console.warn("Error in animation pump:", e);
-        return;
-      }
-      
-      if (src.playbackState !== src.FINISHED_STATE) {
-        requestAnimationFrame(pump);
-      }
-    }
-    pump();
-    
-    return new Promise(resolve => {
-      src.onended = () => {
-        const idx = activeAudioSources.indexOf(src);
-        if (idx !== -1) activeAudioSources.splice(idx, 1);
-        // Resolve either way to keep the playback chain moving; the queue
-        // processor re-checks the interrupt flags before pulling the next chunk.
-        resolve();
-      };
-    });
-  } catch (error) {
-    console.error("Error playing audio chunk:", error);
-    return Promise.resolve(); // Resolve anyway to keep chain going
+  if (ctx.state === 'suspended') {
+    // Fire and forget: resume() needs a user gesture to succeed, and awaiting
+    // it here would push the scheduling of this chunk into a later task, which
+    // is the very thing that used to open the gap.
+    ctx.resume().catch(() => {});
   }
+
+  const buf = ctx.createBuffer(1, audioArr.length, sampleRate);
+  buf.copyToChannel(audioArr instanceof Float32Array ? audioArr : new Float32Array(audioArr), 0);
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playbackAnalyser);
+
+  const now = ctx.currentTime;
+  if (nextPlayTime < now + 0.005) {
+    // Either the first chunk of a turn or a genuine underrun - we can't splice
+    // onto a cursor that's already in the past. SCHEDULE_LEAD gives the first
+    // chunk a little runway so a slow first paint doesn't immediately underrun.
+    nextPlayTime = now + SCHEDULE_LEAD;
+  }
+
+  src.start(nextPlayTime);
+  nextPlayTime += buf.duration;
+
+  currentAudioSource = src;
+  activeAudioSources.push(src);
+  src.onended = () => {
+    const idx = activeAudioSources.indexOf(src);
+    if (idx !== -1) activeAudioSources.splice(idx, 1);
+  };
+
+  if (!isAudioCurrentlyPlaying) {
+    isAudioCurrentlyPlaying = true;
+    startVisualiserPump();
+  }
+}
+
+function startVisualiserPump() {
+  const bins = new Uint8Array(playbackAnalyser.frequencyBinCount);
+  const circle = document.getElementById('voice-circle');
+  function pump() {
+    if (!isAudioCurrentlyPlaying || interruptRequested || interruptInProgress) return;
+    try {
+      playbackAnalyser.getByteFrequencyData(bins);
+      const avg = bins.reduce((a, b) => a + b, 0) / bins.length;
+      if (circle) {
+        circle.style.setProperty('--dynamic-scale', (1 + avg / 255 * 1.5).toFixed(3));
+      }
+    } catch (e) {
+      console.warn("Error in animation pump:", e);
+      return;
+    }
+    requestAnimationFrame(pump);
+  }
+  pump();
+}
+
+// Playback is "done" when the scheduled timeline has run out AND nothing new
+// arrived in the meantime. Checked on a timer rather than from onended so that
+// a late-arriving chunk can still be spliced onto the tail of the current one.
+function scheduleDrainCheck() {
+  if (playbackDrainTimer) clearTimeout(playbackDrainTimer);
+  if (!isAudioCurrentlyPlaying || !audioContext) return;
+
+  const remainingMs = Math.max(0, (nextPlayTime - audioContext.currentTime) * 1000);
+  playbackDrainTimer = setTimeout(() => {
+    playbackDrainTimer = null;
+    if (audioPlaybackQueue.length) {
+      processAudioPlaybackQueue();
+      return;
+    }
+    if (audioContext && nextPlayTime > audioContext.currentTime + 0.005) {
+      scheduleDrainCheck();
+      return;
+    }
+    console.log("📭 Audio timeline drained, stopping playback");
+    isAudioCurrentlyPlaying = false;
+    currentAudioSource = null;
+    nextPlayTime = 0;
+    hideVoiceCircle();
+  }, remainingMs + 40);
 }
 
 async function startRecording() {
@@ -900,26 +939,19 @@ async function setupChatUI() {
     }
   });
   
-  // Initialize audio context
-  if (!audioContext) {
-    try {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      window.audioContext = audioContext;
-    } catch (error) {
-      console.error("Error creating audio context:", error);
-      showNotification("Audio initialization failed. Please refresh the page.", "error");
-    }
-  }
-  
-  // Try to unlock audio context on user interaction
+  // Create the playback context on the first user gesture (so it starts
+  // unsuspended) but at SERVER_SAMPLE_RATE, not the browser default. A default
+  // 44.1/48 kHz context resamples every chunk independently, which distorts
+  // each chunk's edges and makes the splices between them audible.
   ['click', 'touchstart', 'keydown'].forEach(ev =>
     document.addEventListener(ev, function unlock() {
-      if (audioContext && audioContext.state === 'suspended') {
-        try {
+      try {
+        ensurePlaybackContext(SERVER_SAMPLE_RATE);
+        if (audioContext && audioContext.state === 'suspended') {
           audioContext.resume();
-        } catch (error) {
-          console.warn("Error resuming audio context:", error);
         }
+      } catch (error) {
+        console.warn("Error preparing audio context:", error);
       }
       document.removeEventListener(ev, unlock);
     })
