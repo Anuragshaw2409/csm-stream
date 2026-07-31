@@ -722,7 +722,7 @@ def speak_streaming(user_text, session_id="default"):
                           "Sprinkle in occasional filler words and verbal habits "
                           "(e.g. \"um\", \"uh\", \"like\", \"you know\", \"I mean\", \"well\") "
                           "where a person would actually pause or hedge - don't overdo it, "
-                          "and never use them at the very start of a reply.")
+                          "and never use them at the very start of a reply. DO NOT INCLUDE PHONEMES IN THE RESPONSE")
         if rag_context:
             system_prompt += f"\n\nRelevant context:\n{rag_context}"
 
