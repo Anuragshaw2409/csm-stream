@@ -428,7 +428,18 @@ def _handle_completed_utterance(audio_data, sample_rate):
 
         audio_tensor = torch.tensor(audio_data).unsqueeze(0)
         save_audio_and_trim(user_audio_path, session_id, speaker_id, audio_tensor.squeeze(0), sample_rate)
-        add_segment(user_text, speaker_id, audio_tensor.squeeze(0))
+
+        # The mic path runs at 16kHz (VAD + Whisper both want that rate), but
+        # CSM/Mimi tokenizes at generator.sample_rate (24kHz). Handing the 16kHz
+        # tensor straight to add_segment made the model hear every user turn
+        # stretched 1.5x - slower and pitched down - and then match that prosody
+        # in its own reply, turn after turn.
+        context_audio = audio_tensor.squeeze(0)
+        if sample_rate != generator.sample_rate:
+            context_audio = torchaudio.functional.resample(
+                context_audio, orig_freq=sample_rate, new_freq=generator.sample_rate
+            )
+        add_segment(user_text, speaker_id, context_audio)
 
         logger.info(f"User audio saved and segment appended: {user_audio_path}")
 
@@ -539,8 +550,23 @@ def _split_long_sentence(sentence, max_words=22):
 # prosodically - the sentence about to be generated should sound like the one
 # just before it, not like the start of the turn.
 TTS_FRAME_SECONDS = 0.08          # one backbone position per 80ms frame
+TTS_FRAME_SAMPLES = 1920          # 24kHz * 80ms, in samples
 TTS_CONTEXT_BUDGET_TOKENS = 1200  # of 2048; the rest is headroom for the
                                   # sentence being generated and its own frames
+
+
+def _num_protected_segments():
+    """How many of `reference_segments` are the configured voice-clone clips.
+
+    They live at the head of the list; everything after them is
+    conversation-derived and evictable.
+    """
+    return sum(
+        1 for p in (config.reference_audio_path,
+                    config.reference_audio_path2,
+                    config.reference_audio_path3)
+        if p and os.path.exists(p)
+    )
 
 
 def _estimate_segment_tokens(segment):
@@ -558,7 +584,13 @@ def _estimate_segment_tokens(segment):
 
 def _trim_turn_context(turn_context, gen_id):
     """Drop the oldest non-reference segments until the context fits the budget."""
-    keep_head = len(reference_segments)  # never evict the voice references
+    # Only the voice-clone clips are unevictable. This used to be
+    # len(reference_segments), which by turn 2 also covered the conversation
+    # segments appended by add_segment - so stale user/AI audio was protected
+    # as if it were a reference, the budget was blown by the base context
+    # alone, and generate_stream's left-truncation then chopped the actual
+    # reference clips off the head. The voice lost its target and drifted.
+    keep_head = min(_num_protected_segments(), len(turn_context))
     total = sum(_estimate_segment_tokens(s) for s in turn_context)
     dropped = 0
 
@@ -1227,7 +1259,15 @@ def clear_chat_data():
 # memory (that's handled separately by the RAG system + LLM history). Keep it
 # small so the model never approaches its fixed 2048-token position limit,
 # no matter how long the overall conversation runs.
-MAX_DYNAMIC_VOICE_TURNS = 2  # each turn = 1 user segment + 1 AI segment
+#
+# 0 = every turn starts from the protected reference clips alone. Anything
+# higher feeds the model's own previous output back in as the voice reference
+# for the next turn, so whatever rate/loudness drift crept into turn N becomes
+# the target for turn N+1 and compounds - the voice audibly slows down and
+# fades out over a long conversation. Within-turn prosodic continuity, which is
+# what actually keeps consecutive sentences sounding like one utterance, is
+# handled separately by `turn_context` in _generate_sentence_audio.
+MAX_DYNAMIC_VOICE_TURNS = 0  # each turn = 1 user segment + 1 AI segment
 MAX_SEGMENTS = MAX_DYNAMIC_VOICE_TURNS * 2
 
 def add_segment(text, speaker_id, audio_tensor):
@@ -1244,13 +1284,7 @@ def add_segment(text, speaker_id, audio_tensor):
     global reference_segments, generator, config
 
     # Determine the number of protected, initial reference segments based on what was actually loaded.
-    num_protected_segments = 0
-    if config.reference_audio_path and os.path.exists(config.reference_audio_path):
-        num_protected_segments += 1
-    if config.reference_audio_path2 and os.path.exists(config.reference_audio_path2):
-        num_protected_segments += 1
-    if config.reference_audio_path3 and os.path.exists(config.reference_audio_path3):
-        num_protected_segments += 1
+    num_protected_segments = _num_protected_segments()
 
     # Separate protected from dynamic segments from the current global state
     protected_segments = reference_segments[:num_protected_segments]
@@ -1262,7 +1296,12 @@ def add_segment(text, speaker_id, audio_tensor):
 
     # Keep only the last MAX_DYNAMIC_VOICE_TURNS conversational turns of audio
     # context, regardless of how many protected reference clips are configured.
-    if len(dynamic_segments) > MAX_SEGMENTS:
+    # Note MAX_SEGMENTS == 0 has to be special-cased: `[-0:]` is `[0:]`, i.e.
+    # the whole list, so the obvious slice would keep everything instead of
+    # nothing.
+    if MAX_SEGMENTS <= 0:
+        dynamic_segments = []
+    elif len(dynamic_segments) > MAX_SEGMENTS:
         dynamic_segments = dynamic_segments[-MAX_SEGMENTS:]
 
     # Then, check and trim by token count if necessary.
@@ -1278,8 +1317,11 @@ def add_segment(text, speaker_id, audio_tensor):
                 tokens = generator._text_tokenizer.encode(f"[{segment.speaker}]{segment.text}")
                 total_tokens += len(tokens)
                 if segment.audio is not None:
-                    # Approximate frame count to token conversion
-                    audio_frames = segment.audio.size(0) // 6094
+                    # One backbone position per 80ms frame. The divisor used to
+                    # be 6094, which has no relation to the frame size and
+                    # under-counted audio positions ~3x, so this trim never
+                    # fired and the prompt silently overran the 2048 window.
+                    audio_frames = segment.audio.size(0) // TTS_FRAME_SAMPLES
                     total_tokens += audio_frames
 
             # Model's hard position limit is 2048; leave headroom for the new
@@ -1300,7 +1342,7 @@ def add_segment(text, speaker_id, audio_tensor):
             text_tokens = len(words) + punctuation
             audio_tokens = 0
             if segment.audio is not None:
-                audio_frames = segment.audio.size(0) // 6094
+                audio_frames = segment.audio.size(0) // TTS_FRAME_SAMPLES
                 audio_tokens = audio_frames
             return text_tokens + audio_tokens
 
@@ -1315,9 +1357,14 @@ def add_segment(text, speaker_id, audio_tensor):
     # This is the single source of truth for the update.
     reference_segments = protected_segments + dynamic_segments
 
-    # Log the final state for debugging
+    # Log the final state for debugging. The estimated position count is the
+    # number to watch across a long conversation: it should stay flat turn to
+    # turn. If it climbs, the voice references are on their way to being
+    # left-truncated out of the prompt and the voice will start to drift.
+    est_positions = sum(_estimate_segment_tokens(s) for s in reference_segments)
     logger.info(f"Context updated. Segments: {len(reference_segments)} total " +
-                f"({len(protected_segments)} protected, {len(dynamic_segments)} dynamic).")
+                f"({len(protected_segments)} protected, {len(dynamic_segments)} dynamic), " +
+                f"~{est_positions} of {generator.max_seq_len} positions.")
 
 def preprocess_text_for_tts(text):
     """
