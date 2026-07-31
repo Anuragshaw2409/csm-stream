@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import math
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"  
@@ -105,6 +106,11 @@ class CompanionConfig(BaseModel):
     model_path: str
     llm_path: str
     max_tokens: int = 8192
+    # Backstop only - the system prompt is what actually keeps replies short.
+    # Sized so a reply that obeys the brevity instruction always ends naturally
+    # before the cap, while a runaway one still can't outgrow the TTS context
+    # window (see TTS_CONTEXT_BUDGET_TOKENS).
+    response_max_tokens: int = 300
     voice_speaker_id: int = 0
     vad_enabled: bool = True
     vad_threshold: float = 0.5
@@ -326,7 +332,8 @@ def initialize_models(config_data: CompanionConfig):
     logger.info(f"Loading LLM (OpenRouter model: {openrouter_model}) …")
     llm = LLMInterface(api_key=openrouter_api_key,
                        model=openrouter_model,
-                       max_tokens=config_data.max_tokens)
+                       max_tokens=config_data.max_tokens,
+                       response_max_tokens=config_data.response_max_tokens)
 
     logger.info("Loading RAG …")
     rag = RAGSystem("companion.db",
@@ -515,6 +522,61 @@ def _split_long_sentence(sentence, max_words=22):
     return chunks
 
 
+# --- TTS context window budget ---------------------------------------------
+# CSM's backbone has a fixed 2048-position window (`Generator.max_seq_len`). One
+# position is one frame of audio (80ms) or one text token, and generate_stream
+# is fed reference_segments + every sentence already spoken this turn. So the
+# prompt grows monotonically as a reply is spoken, and a long enough reply
+# overruns the window - at which point two bad things happen silently:
+# generate_stream truncates the prompt from the LEFT (`prompt_tokens[-max_seq_len:]`,
+# generator.py), which discards the reference segments that define the voice, so
+# the voice drifts mid-reply; and generation aborts early on the
+# `curr_pos.max()+1 >= max_seq_len` guard, cutting the audio off.
+#
+# Bounding reply length makes this unlikely; bounding the context makes it
+# impossible. Reference segments are never dropped (they are the voice); the
+# oldest same-turn sentences go first, which is also the right thing
+# prosodically - the sentence about to be generated should sound like the one
+# just before it, not like the start of the turn.
+TTS_FRAME_SECONDS = 0.08          # one backbone position per 80ms frame
+TTS_CONTEXT_BUDGET_TOKENS = 1200  # of 2048; the rest is headroom for the
+                                  # sentence being generated and its own frames
+
+
+def _estimate_segment_tokens(segment):
+    """Positions a Segment will occupy in the CSM prompt.
+
+    Mirrors generator._tokenize_segment: text tokens + one frame per 80ms of
+    audio + 1 EOS frame. The text side is estimated (~4 chars/token) rather than
+    tokenized - this runs per sentence on the critical path, and the budget
+    carries ~800 positions of headroom to absorb the error.
+    """
+    audio_frames = int(math.ceil(len(segment.audio) / (generator.sample_rate * TTS_FRAME_SECONDS))) + 1
+    text_tokens = len(segment.text) // 4 + 4  # +4 for the "[speaker]" prefix
+    return audio_frames + text_tokens
+
+
+def _trim_turn_context(turn_context, gen_id):
+    """Drop the oldest non-reference segments until the context fits the budget."""
+    keep_head = len(reference_segments)  # never evict the voice references
+    total = sum(_estimate_segment_tokens(s) for s in turn_context)
+    dropped = 0
+
+    # len(turn_context) > keep_head + 1: always keep the most recent sentence,
+    # even if it alone blows the budget - generating with no immediate prosodic
+    # predecessor is worse than being slightly over, and generate_stream's own
+    # left-truncation still protects the hard limit.
+    while total > TTS_CONTEXT_BUDGET_TOKENS and len(turn_context) > keep_head + 1:
+        total -= _estimate_segment_tokens(turn_context.pop(keep_head))
+        dropped += 1
+
+    if dropped:
+        logger.info(
+            f"Generation {gen_id} - trimmed {dropped} old sentence segment(s) from TTS context "
+            f"(~{total} tokens of {TTS_CONTEXT_BUDGET_TOKENS} budget, window is {generator.max_seq_len})"
+        )
+
+
 def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id, cancel):
     """Run CSM on a single completed LLM sentence, streaming each resulting
     audio chunk to the client immediately as it's generated (true streaming
@@ -660,6 +722,7 @@ def _generate_sentence_audio(sentence_text, turn_context, playback_state, gen_id
     if sentence_chunks:
         sentence_audio = torch.cat([torch.from_numpy(c) for c in sentence_chunks])
         turn_context.append(Segment(text=sentence_text, speaker=config.voice_speaker_id, audio=sentence_audio))
+        _trim_turn_context(turn_context, gen_id)
 
     return True
 
@@ -723,6 +786,17 @@ def speak_streaming(user_text, session_id="default"):
                           "(e.g. \"um\", \"uh\", \"like\", \"you know\", \"I mean\", \"well\") "
                           "where a person would actually pause or hedge - don't overdo it, "
                           "and never use them at the very start of a reply. DO NOT INCLUDE PHONEMES IN THE RESPONSE")
+        # This is the real length control. Every reply is spoken aloud, so length
+        # costs the user wall-clock time, and the whole reply's audio accumulates
+        # in the TTS context window (2048 positions) as the turn progresses.
+        # Keeping replies to a few spoken sentences keeps both bounded, and means
+        # generation ends on its own well before response_max_tokens - which is
+        # what stops replies being chopped off mid-word.
+        system_prompt += ("\n\nThis is a spoken conversation, so keep every reply short: "
+                          "at most 2-4 sentences (roughly 60 words). Answer the question directly "
+                          "and stop - don't list every detail you know. If there is more worth "
+                          "saying, say one short thing and offer to go deeper instead of "
+                          "continuing. Always finish your final sentence.")
         if rag_context:
             system_prompt += f"\n\nRelevant context:\n{rag_context}"
 
@@ -743,6 +817,7 @@ def speak_streaming(user_text, session_id="default"):
             sentence_buffer = ""
             llm_request_time = time.time()
             llm_first_token_logged = False
+            emitted_any_sentence = False
             try:
                 with llm_lock:
                     for delta in llm.generate_response_stream(system_prompt, user_text, context):
@@ -761,11 +836,37 @@ def speak_streaming(user_text, session_id="default"):
 
                         complete_sentences, sentence_buffer = extract_complete_sentences(sentence_buffer)
                         for sentence in complete_sentences:
+                            emitted_any_sentence = True
                             for chunk in _split_long_sentence(sentence):
                                 sentence_queue.put(chunk)
 
-                    if not cancel.is_set() and sentence_buffer.strip():
-                        for chunk in _split_long_sentence(sentence_buffer.strip()):
+                    # Whatever is left in the buffer has no terminal punctuation.
+                    # Normally that's just a final sentence the model ended
+                    # without a period, and it should be spoken. But when the
+                    # provider says it stopped because of "length", the remainder
+                    # is a fragment chopped mid-word by the token cap - speaking
+                    # it is what produced replies trailing off into nothing. Drop
+                    # it and end on the last complete sentence instead. If
+                    # nothing complete was produced at all, speak the fragment
+                    # anyway: a clipped answer beats silence.
+                    truncated = llm.last_finish_reason == "length"
+                    tail = sentence_buffer.strip()
+                    if truncated and tail and emitted_any_sentence:
+                        logger.warning(
+                            f"Generation {this_id} - LLM hit the {llm.response_max_tokens}-token cap; "
+                            f"dropping incomplete trailing fragment: {tail!r}"
+                        )
+                        # Keep the transcript and the saved history in sync with
+                        # what was actually spoken. rfind rather than a negative
+                        # slice: full_text ends with the raw buffer, which may
+                        # carry trailing whitespace that `tail` has stripped.
+                        cut = producer_state["full_text"].rfind(tail)
+                        if cut != -1:
+                            producer_state["full_text"] = producer_state["full_text"][:cut].rstrip()
+                        tail = ""
+
+                    if not cancel.is_set() and tail:
+                        for chunk in _split_long_sentence(tail):
                             sentence_queue.put(chunk)
             except Exception as e:
                 producer_state["error"] = e

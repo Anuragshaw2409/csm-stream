@@ -55,6 +55,21 @@ Because sentence N+1 isn't dispatched to `model_queue` until sentence N is fully
 
 Truncation is a related but separate failure mode: `max_audio_length_ms` cap is derived from an estimated words-per-minute duration (`main.py:419-420`) that is frequently off by 2-3x sentence-to-sentence (confirmed in logs — 6.64s actual vs 13.41s estimated on one sentence, 22.56s actual vs 14.12s estimated, i.e. cap hit, on the very next one). A tight/wrong cap can truncate a natural sentence before its own EOS frame.
 
+## Reply length and the TTS context budget
+
+Two separate limits, often confused:
+
+- `CompanionConfig.response_max_tokens` (default 300, `main.py`) → sent as `max_tokens` to OpenRouter. A **backstop**, not the length control. It was previously hardcoded at 200 in `LLMInterface.__init__` and never passed by `initialize_models`, so ordinary replies ran into it and were cut off mid-word — the reply just stopped, and nothing noticed.
+- `Generator.max_seq_len` = 2048 → CSM's backbone window. One position per text token or per 80ms audio frame.
+
+Three things keep replies inside both:
+
+1. **The system prompt asks for 2–4 sentences (~60 words)** (`main.py`, appended next to the filler-word instruction). This is the actual length control — a compliant reply ends naturally far below the token cap, so the cap never truncates anything.
+2. **`finish_reason == "length"` drops the trailing fragment** (`_llm_producer`). `LLMInterface.last_finish_reason` is set from the final SSE chunk; when the cap did hit, the unterminated remainder in `sentence_buffer` is a mid-word fragment and is discarded rather than spoken, so the reply ends on its last complete sentence. `producer_state["full_text"]` is trimmed to match so the transcript and saved history reflect what was actually said. Exception: if no complete sentence was produced at all, the fragment is spoken anyway — a clipped answer beats silence.
+3. **`_trim_turn_context` bounds the CSM prompt** to `TTS_CONTEXT_BUDGET_TOKENS` (1200 of 2048; the rest is headroom for the sentence being generated plus its own frames). `turn_context` grows by one segment per spoken sentence, so without this a long reply overruns the window and fails *silently in two ways*: `generate_stream` truncates the prompt from the left (`prompt_tokens[-max_seq_len:]`), discarding the reference segments that define the voice — so the voice drifts mid-reply — and generation then aborts early on the `curr_pos.max()+1 >= max_seq_len` guard. Reference segments are never evicted; oldest same-turn sentences go first, which is also right prosodically. The most recent sentence is always kept even if it alone exceeds the budget (`_split_long_sentence`'s 22-word cap makes that ~115 positions in practice, so it doesn't arise).
+
+Note `LLMInterface.generate_response_stream` must set `response.encoding = "utf-8"`: requests defaults any `text/*` content type without a charset to ISO-8859-1, and SSE is `text/event-stream`, so every em-dash arrived as `â` and went straight into TTS. It also defeated the em-dash normalisation at `main.py:1235`, which had no dash left to match.
+
 ## Chunk splicing / audible clicks
 
 Chunks are consecutive slices of one continuous waveform *within* a sentence (the Mimi decoder is stateful across `decode()` calls inside the `streaming(1)` context), but sentences are fully independent generations with no waveform continuity between them. Two rules follow, and breaking either produces clicking at chunk boundaries:
