@@ -1416,7 +1416,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     # frames out. A barge-in could not be serviced while the
                     # server was busy processing the audio that caused it.
                     # Single worker thread, so mic chunks stay strictly ordered.
-                    await loop.run_in_executor(vad_executor, vad_processor.process_audio, audio_data)
+                    #
+                    # Must be the *running* loop, not the module-global `loop`:
+                    # that one is a second event loop spun up in a background
+                    # thread (see __main__), while this handler runs on
+                    # uvicorn's own loop. Scheduling here against the global
+                    # loop produces a Future belonging to another loop and
+                    # fails with "attached to a different loop" on every mic
+                    # chunk. The global `loop` stays correct for the
+                    # run_coroutine_threadsafe() calls made from worker threads.
+                    await asyncio.get_running_loop().run_in_executor(
+                        vad_executor, vad_processor.process_audio, audio_data
+                    )
                 else:
                     text = transcribe_audio(audio_data, sample_rate)
                     await websocket.send_json({"type": "transcription", "text": text})
