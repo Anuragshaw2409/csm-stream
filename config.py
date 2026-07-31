@@ -47,6 +47,7 @@ class ConfigManager:
                 "reference_audio_path3"
             ]
             
+            
             # Log which references are being saved
             for path_key in ref_paths:
                 if path_key in config_data and config_data[path_key]:
